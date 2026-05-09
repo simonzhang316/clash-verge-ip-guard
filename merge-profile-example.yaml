@@ -1,0 +1,59 @@
+# Clash Verge Rev - Merge Profile 示例
+# 位置：Clash Verge → Profiles → 对应订阅的 Merge 配置
+# 实际文件：~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/<uid>.yaml
+#
+# 本文件为脱敏版本，密码/用户名已替换为占位符。
+
+tcp-concurrent: true
+unified-delay: true
+
+prepend-proxies:
+  - { name: 'Claude-Residential', type: socks5, server: <YOUR_SOCKS5_IP>, port: <PORT>, username: <USERNAME>, password: <PASSWORD>, udp: true}
+
+prepend-proxy-groups:
+  - name: Claude
+    type: select
+    proxies:
+      - Claude-Residential
+      - REJECT
+  - name: Codex-Stable
+    type: fallback
+    proxies:
+      - JP2-HY2
+      - JP1-HY2
+      - JP3-HY2
+      - HK2-HY2
+      - HK3-HY2
+    url: 'https://chatgpt.com/cdn-cgi/trace'
+    interval: 600
+    lazy: true
+
+prepend-rules:
+  # === 国内服务直连（不走代理）===
+  - 'DOMAIN-SUFFIX,feishu.cn,DIRECT'
+  - 'DOMAIN-SUFFIX,larksuite.com,DIRECT'
+  - 'DOMAIN-SUFFIX,larksuit.com,DIRECT'
+  - 'DOMAIN-SUFFIX,bytedance.com,DIRECT'
+
+  # === Claude API 走家宽 IP ===
+  - 'DOMAIN,ifconfig.me,Claude'
+  - 'DOMAIN,api.ipify.org,Claude'
+  - 'DOMAIN,ipv4.icanhazip.com,Claude'
+  - 'DOMAIN-SUFFIX,ip.sb,Claude'
+  - 'DOMAIN-SUFFIX,ping0.cc,Claude'
+  - 'PROCESS-NAME,curl,Claude'
+  - 'DOMAIN-SUFFIX,anthropic.com,Claude'
+  - 'DOMAIN-SUFFIX,claude.ai,Claude'
+  - 'DOMAIN-SUFFIX,claude.com,Claude'
+  - 'DOMAIN-SUFFIX,clau.de,Claude'
+  - 'DOMAIN-SUFFIX,modelcontextprotocol.io,Claude'
+  - 'DOMAIN,anthropic.statuspage.io,Claude'
+  - 'IP-CIDR,160.79.104.0/21,Claude,no-resolve'
+  - 'IP-CIDR6,2607:6bc0::/48,Claude,no-resolve'
+  - 'IP-CIDR,<YOUR_SOCKS5_IP>/32,DIRECT,no-resolve'
+
+  # === OpenAI / Codex 走稳定节点 ===
+  - 'DOMAIN-SUFFIX,chatgpt.com,Codex-Stable'
+  - 'DOMAIN-SUFFIX,openai.com,Codex-Stable'
+  - 'DOMAIN-SUFFIX,oaistatic.com,Codex-Stable'
+  - 'DOMAIN-SUFFIX,oaiusercontent.com,Codex-Stable'
