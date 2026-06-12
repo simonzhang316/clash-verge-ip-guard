@@ -4,7 +4,6 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOST="127.0.0.1"
 PORT="8765"
-EXPECTED_IP="${1:-${CLAUDE_STATIC_IP:-<YOUR_STATIC_IP>}}"
 
 cd "$BASE_DIR"
 
@@ -15,8 +14,18 @@ if [[ -n "$OLD_PID" ]]; then
   sleep 0.5
 fi
 
-nohup python3 "$BASE_DIR/ip_monitor_server.py" --host "$HOST" --port "$PORT" --expected "$EXPECTED_IP" \
+# Rotate the cockpit log at restart if oversized (>20MB), same archive dir
+# as the enforcer log rotation (issue S7).
+LOG="$BASE_DIR/ip_monitor_server.log"
+ARCHIVE_DIR="$HOME/.local/log/archive"
+if [[ -f "$LOG" && "$(/usr/bin/stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 20971520 ]]; then
+  /bin/mkdir -p "$ARCHIVE_DIR"
+  mv "$LOG" "$ARCHIVE_DIR/ip_monitor_server.log.$(date '+%Y%m%d-%H%M%S')" || true
+fi
+
+# Expected IP comes from the guard's state.json — no argument needed (ADR-0002).
+nohup python3 "$BASE_DIR/ip_monitor_server.py" --host "$HOST" --port "$PORT" \
   > "$BASE_DIR/ip_monitor_server.log" 2>&1 &
 
-echo "IP monitor started: http://$HOST:$PORT"
+echo "Cockpit started: http://$HOST:$PORT"
 open "http://$HOST:$PORT" >/dev/null 2>&1 || true
