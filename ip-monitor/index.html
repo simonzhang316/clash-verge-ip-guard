@@ -155,7 +155,7 @@
     </div>
     <div class="conn-table-wrap">
       <table id="conn-table">
-        <thead><tr><th>进程</th><th>目标</th><th>规则</th><th>代理链</th><th>↑</th><th>↓</th></tr></thead>
+        <thead><tr><th>进程</th><th>网络</th><th>目标</th><th>规则</th><th>代理链</th><th>↑</th><th>↓</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -466,12 +466,12 @@ async function refreshConns() {
     const tr = document.createElement("tr");
     if (risky) tr.className = "hl";
     tr.innerHTML =
-      `<td>${proc}</td><td>${dest}${port}</td>` +
+      `<td>${proc}</td><td>${md.network || "?"}</td><td>${dest}${port}</td>` +
       `<td>${c.rule || ""}${c.rulePayload ? " " + c.rulePayload : ""}</td>` +
       `<td>${chains}</td>` +
       `<td class="num">${fmtRate(upRate)}</td><td class="num">${fmtRate(downRate)}</td>`;
     tbody.appendChild(tr);
-    connLast.push({ process: proc, dest: dest + port, rule: (c.rule || "") + (c.rulePayload ? " " + c.rulePayload : ""), chains, upload: c.upload, download: c.download, start: c.start });
+    connLast.push({ process: proc, network: md.network, dest: dest + port, rule: (c.rule || "") + (c.rulePayload ? " " + c.rulePayload : ""), chains, upload: c.upload, download: c.download, start: c.start });
   }
   connPrev = nextPrev;
   document.getElementById("conn-stat").textContent =
