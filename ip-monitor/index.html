@@ -95,6 +95,14 @@
   #conn-table td { padding: 3px 8px; border-top: 1px solid var(--line); word-break: break-all; }
   #conn-table td.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
   #conn-table tr.hl td { background: rgba(210, 153, 34, .12); }
+  .btn-sm {
+    background: var(--line); border: none; border-radius: 6px; color: var(--text);
+    padding: 2px 10px; font-size: 12px; cursor: pointer; margin-left: 8px;
+  }
+  .btn-sm:hover { background: #3a4450; }
+  .btn-sm:disabled { opacity: .4; cursor: default; }
+  .members div.switchable { cursor: pointer; }
+  .members div.switchable:hover { color: var(--ok); }
 </style>
 </head>
 <body>
@@ -107,6 +115,7 @@
   <div class="card" id="guard-card">
     <h2>家宽出口（Claude 静态 IP）</h2>
     <span class="badge gray" id="guard-badge">加载中</span>
+    <button class="btn-sm" id="recheck-btn" title="触发 enforcer 立即跑一轮（守护层仍是唯一修复者）">重检出口</button>
     <div class="kv">
       <div><span class="k">期望 IP</span><span class="v" id="g-expected">—</span></div>
       <div><span class="k">守护状态</span><span class="v" id="g-status">—</span></div>
@@ -178,6 +187,48 @@ function setBadge(cls, text) {
   b.textContent = text;
 }
 
+// ---- 操作层（S3）：token + 三类运行时操作 ----
+function getToken(forceAsk) {
+  let t = localStorage.getItem("cockpit-token");
+  if (!t || forceAsk) {
+    t = prompt("输入 Cockpit 操作 token（位于 ~/.local/state/claude-ip-guard/cockpit-token）：", t || "");
+    if (t) localStorage.setItem("cockpit-token", t.trim());
+  }
+  return (t || "").trim();
+}
+
+async function opPost(path, body) {
+  let token = getToken(false);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Cockpit-Token": token },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await r.json();
+    if (r.status === 401 && attempt === 0) { token = getToken(true); continue; }
+    return { status: r.status, data };
+  }
+}
+
+async function switchGroup(group, name) {
+  if (!confirm(`把 ${group} 切到 ${name}？`)) return;
+  const r = await opPost("/api/ops/select-group", { group, name });
+  if (r.status !== 200) alert(`切换失败: ${r.data.error}${r.data.hint ? "\n" + r.data.hint : ""}`);
+  refreshClash();
+}
+
+async function delayTest(group, gtype, btn) {
+  if ((gtype === "URLTest" || gtype === "Fallback") &&
+      !confirm(`${group} 是 ${gtype} 自动选组：测速会刷新延迟排名，可能触发组内切换、影响长连接。继续？`)) return;
+  btn.disabled = true; btn.textContent = "测速中…";
+  const r = await opPost("/api/ops/delay-test", { group });
+  btn.disabled = false; btn.textContent = "测速";
+  if (r.status === 429) alert(`太频繁：${r.data.retry_after_s}s 后再试`);
+  else if (r.status !== 200) alert(`测速失败: ${r.data.error}${r.data.hint ? "\n" + r.data.hint : ""}`);
+  refreshClash();
+}
+
 function delayInfo(proxies, name, depth = 0) {
   // Resolve nested groups (主代理 -> 自动选择 -> node) to the leaf node.
   let leaf = name;
@@ -218,10 +269,20 @@ function renderGroups(proxies) {
       `<span class="gtype">${g.type}</span>` +
       `<span class="gnow">${g.now || "—"}</span>` +
       `<span class="ms"><span class="dot ${dotCls(delay)}"></span>${delay ? delay + " ms" : "—"}</span>`;
+    // 测速按钮：Claude 锁定组与含家宽节点的组不提供（服务端同样拒绝）
+    const testable = name !== "Claude" && !(g.all || []).includes("Claude-Residential");
+    if (testable) {
+      const btn = document.createElement("button");
+      btn.className = "btn-sm";
+      btn.textContent = "测速";
+      btn.addEventListener("click", ev => { ev.preventDefault(); ev.stopPropagation(); delayTest(name, g.type, btn); });
+      sum.appendChild(btn);
+    }
     det.appendChild(sum);
 
     const mem = document.createElement("div");
     mem.className = "members";
+    const switchable = g.type === "Selector" && name !== "Claude";
     for (const m of g.all || []) {
       const mh = (proxies[m] && proxies[m].history) || [];
       const md = mh.length ? mh[mh.length - 1].delay : 0;
@@ -229,6 +290,11 @@ function renderGroups(proxies) {
       row.innerHTML =
         `<span class="${m === g.now ? "cur" : ""}">${m}</span>` +
         `<span class="ms"><span class="dot ${dotCls(md)}"></span>${md ? md + " ms" : "—"}</span>`;
+      if (switchable && m !== g.now) {
+        row.className = "switchable";
+        row.title = `切换 ${name} → ${m}`;
+        row.addEventListener("click", () => switchGroup(name, m));
+      }
       mem.appendChild(row);
     }
     det.appendChild(mem);
@@ -404,6 +470,14 @@ async function refreshConns() {
   document.getElementById("conn-stat").textContent =
     `${conns.length} 条连接` + (filter ? `（筛选: ${filter}）` : "") + ` · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
 }
+
+document.getElementById("recheck-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("recheck-btn");
+  btn.disabled = true; btn.textContent = "已触发…";
+  const r = await opPost("/api/ops/recheck", {});
+  if (r.status !== 200) alert("重检触发失败: " + r.data.error);
+  setTimeout(() => { refreshGuard(); btn.disabled = false; btn.textContent = "重检出口"; }, 11000);
+});
 
 document.getElementById("conn-pause").addEventListener("click", () => {
   connPaused = !connPaused;

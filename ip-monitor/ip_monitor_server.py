@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hmac
 import http.client
 import json
 import os
+import secrets
 import socket
 import socketserver
+import subprocess
 import sys
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -58,6 +62,115 @@ VERGE_APPDIR = Path(
 PROFILES_INDEX = VERGE_APPDIR / "profiles.yaml"
 
 _node_count_cache: dict[str, tuple[float, int | None]] = {}
+
+# --- S3 operations layer ---------------------------------------------------
+# Ops are the ONLY mutating surface and they are runtime-only (ADR-0002):
+# selector switching (Claude locked), manual delay tests (never for groups
+# containing Claude-Residential), guard recheck via launchctl kickstart.
+COCKPIT_TOKEN_FILE = Path(
+    os.environ.get(
+        "COCKPIT_TOKEN_FILE",
+        str(Path.home() / ".local/state/claude-ip-guard/cockpit-token"),
+    )
+)
+ENFORCER_LAUNCHD_LABEL = "com.zhangxinran.claude-ip-enforcer"
+DELAY_TEST_URL = "http://cp.cloudflare.com/generate_204"
+DELAY_TEST_TIMEOUT_MS = 5000
+DELAY_THROTTLE_S = 30
+GROUP_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance"}
+
+_delay_last_test: dict[str, float] = {}
+
+
+def load_or_create_token() -> str:
+    try:
+        token = COCKPIT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    except OSError:
+        pass
+    token = secrets.token_hex(16)
+    COCKPIT_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    COCKPIT_TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
+    COCKPIT_TOKEN_FILE.chmod(0o600)
+    return token
+
+
+COCKPIT_TOKEN = load_or_create_token()
+
+
+def token_ok(header_value: str | None) -> bool:
+    return bool(header_value) and hmac.compare_digest(header_value, COCKPIT_TOKEN)
+
+
+def op_select_group(payload: dict) -> tuple[int, dict]:
+    group = str(payload.get("group", ""))
+    name = str(payload.get("name", ""))
+    if not group or not name:
+        return 400, {"error": "missing_group_or_name"}
+    if group == "Claude":
+        return 403, {"error": "claude_locked", "hint": "Claude 组由守护层锁定（ADR-0002）"}
+    status, info = mihomo_get("/proxies/" + urllib.parse.quote(group))
+    if status != 200:
+        return 404, {"error": "group_not_found"}
+    if info.get("type") != "Selector":
+        return 403, {"error": "not_a_selector", "hint": f"{group} 是 {info.get('type')}，自动选组不可手动切"}
+    if name not in (info.get("all") or []):
+        return 400, {"error": "name_not_in_group"}
+    status, _ = mihomo_request(
+        "PUT", "/proxies/" + urllib.parse.quote(group), {"name": name}
+    )
+    if status not in (200, 204):
+        return 502, {"error": f"mihomo_put_failed_{status}"}
+    _, after = mihomo_get("/proxies/" + urllib.parse.quote(group))
+    return 200, {"ok": True, "group": group, "now": after.get("now")}
+
+
+def op_delay_test(payload: dict) -> tuple[int, dict]:
+    group = str(payload.get("group", ""))
+    if not group:
+        return 400, {"error": "missing_group"}
+    if group == "Claude":
+        return 403, {"error": "claude_locked"}
+    status, info = mihomo_get("/proxies/" + urllib.parse.quote(group))
+    if status != 200:
+        return 404, {"error": "group_not_found"}
+    if info.get("type") not in GROUP_TYPES:
+        return 400, {"error": "not_a_group"}
+    if "Claude-Residential" in (info.get("all") or []):
+        return 403, {
+            "error": "claude_residential_protected",
+            "hint": "该组包含家宽节点，禁止主动测速（ADR-0002）",
+        }
+    now = time.monotonic()
+    last = _delay_last_test.get(group)
+    if last is not None and now - last < DELAY_THROTTLE_S:
+        return 429, {"error": "throttled", "retry_after_s": int(DELAY_THROTTLE_S - (now - last))}
+    _delay_last_test[group] = now
+    q = urllib.parse.urlencode({"url": DELAY_TEST_URL, "timeout": DELAY_TEST_TIMEOUT_MS})
+    status, result = mihomo_request(
+        "GET", "/group/" + urllib.parse.quote(group) + "/delay?" + q, timeout=20.0
+    )
+    if status != 200:
+        return 502, {"error": f"delay_test_failed_{status}", "detail": result}
+    return 200, {"ok": True, "group": group, "delays": result}
+
+
+def op_recheck() -> tuple[int, dict]:
+    # Kick the enforcer for an immediate cycle: the guard stays the single
+    # repairer; the cockpit only asks it to run now instead of in <=30s.
+    try:
+        proc = subprocess.run(
+            ["/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{ENFORCER_LAUNCHD_LABEL}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 502, {"error": f"kickstart_failed_{type(exc).__name__}"}
+    if proc.returncode != 0:
+        return 502, {"error": "kickstart_failed", "detail": proc.stderr.strip()[:200]}
+    return 200, {"ok": True, "hint": "enforcer 已触发，约 10 秒后刷新守护状态"}
 
 
 def log_access(method: str, path: str, status: int) -> None:
@@ -129,20 +242,33 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = s
 
 
-def mihomo_get(path: str) -> tuple[int, dict]:
-    conn = UnixHTTPConnection(MIHOMO_SOCK)
+def mihomo_request(
+    method: str, path: str, body: dict | None = None, timeout: float = 5.0
+) -> tuple[int, dict]:
+    conn = UnixHTTPConnection(MIHOMO_SOCK, timeout=timeout)
     try:
-        conn.request("GET", path, headers={"Host": "localhost"})
+        headers = {"Host": "localhost"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=headers)
         resp = conn.getresponse()
-        body = resp.read()
+        raw = resp.read()
+        if not raw:
+            return resp.status, {}
         try:
-            return resp.status, json.loads(body)
+            return resp.status, json.loads(raw)
         except ValueError:
             return 502, {"error": "mihomo_bad_json"}
     except OSError as exc:
         return 502, {"error": f"mihomo_unreachable_{type(exc).__name__}"}
     finally:
         conn.close()
+
+
+def mihomo_get(path: str) -> tuple[int, dict]:
+    return mihomo_request("GET", path)
 
 
 def profile_node_count(profile_file: Path) -> int | None:
@@ -252,14 +378,39 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         self._reject_write("PUT")
 
-    def do_POST(self) -> None:  # noqa: N802
-        self._reject_write("POST")
-
     def do_PATCH(self) -> None:  # noqa: N802
         self._reject_write("PATCH")
 
     def do_DELETE(self) -> None:  # noqa: N802
         self._reject_write("DELETE")
+
+    def _read_json_body(self) -> dict:
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), 65536)
+            if length <= 0:
+                return {}
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, OSError):
+            return {}
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.startswith("/api/ops/"):
+            self._reject_write("POST")
+            return
+        if not token_ok(self.headers.get("X-Cockpit-Token")):
+            self._send_json(401, {"error": "bad_token", "hint": "操作端点需要 token"}, "POST")
+            return
+        payload = self._read_json_body()
+        if parsed.path == "/api/ops/select-group":
+            status, result = op_select_group(payload)
+        elif parsed.path == "/api/ops/delay-test":
+            status, result = op_delay_test(payload)
+        elif parsed.path == "/api/ops/recheck":
+            status, result = op_recheck()
+        else:
+            status, result = 404, {"error": "unknown_op"}
+        self._send_json(status, result, "POST")
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
