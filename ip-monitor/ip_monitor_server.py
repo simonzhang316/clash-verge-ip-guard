@@ -14,15 +14,19 @@ import argparse
 import datetime as dt
 import hmac
 import http.client
+import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import socketserver
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -156,6 +160,58 @@ def op_delay_test(payload: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "group": group, "delays": result}
 
 
+# --- S6 global egress probe ------------------------------------------------
+# Probes run from THIS python process, so they are not captured by the
+# `PROCESS-NAME,curl -> Claude` rule and none of these domains are in the
+# Claude probe rules: they fall through MATCH to the global egress (主代理).
+# Dual source on purpose: ip-api is plain HTTP, ipinfo is HTTPS — "HTTP ok
+# but TLS fails" is itself a diagnostic for a broken airport node.
+EGRESS_SOURCES = [
+    ("ip-api(http)", "http://ip-api.com/line?fields=query"),
+    ("ipinfo(https)", "https://ipinfo.io/ip"),
+]
+EGRESS_CACHE_S = 60
+EGRESS_FORCE_MIN_S = 15
+IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_egress_lock = threading.Lock()
+_egress_cache: dict = {"t": 0.0, "data": None}
+
+
+def probe_global_egress() -> dict:
+    sources = []
+    consensus = None
+    for name, url in EGRESS_SOURCES:
+        t0 = time.monotonic()
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Cockpit/1.0"})
+            raw = urllib.request.urlopen(req, timeout=6).read(256).decode("utf-8", "replace").strip()
+            latency = int((time.monotonic() - t0) * 1000)
+            ip = raw if IPV4_RE.match(raw) else None
+            sources.append({"name": name, "ok": bool(ip), "ip": ip, "latency_ms": latency})
+            if ip and consensus is None:
+                consensus = ip
+        except Exception as exc:  # noqa: BLE001 — per-source diagnostics
+            sources.append({"name": name, "ok": False, "error": type(exc).__name__})
+    return {
+        "ok": consensus is not None,
+        "ip": consensus,
+        "sources": sources,
+        "probed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def global_egress(force: bool) -> dict:
+    with _egress_lock:
+        now = time.monotonic()
+        age = now - _egress_cache["t"]
+        max_age = EGRESS_FORCE_MIN_S if force else EGRESS_CACHE_S
+        if _egress_cache["data"] is not None and age < max_age:
+            return {**_egress_cache["data"], "cached": True}
+        data = probe_global_egress()
+        _egress_cache.update(t=time.monotonic(), data=data)
+        return {**data, "cached": False}
+
+
 def op_recheck() -> tuple[int, dict]:
     # Kick the enforcer for an immediate cycle: the guard stays the single
     # repairer; the cockpit only asks it to run now instead of in <=30s.
@@ -173,11 +229,29 @@ def op_recheck() -> tuple[int, dict]:
     return 200, {"ok": True, "hint": "enforcer 已触发，约 10 秒后刷新守护状态"}
 
 
+ACCESS_LOG_FILE = BASE_DIR / "ip_monitor_server.log"
+ACCESS_LOG_MAX_BYTES = 20 * 1024 * 1024
+LOG_ARCHIVE_DIR = Path.home() / ".local/log/archive"
+_access_lock = threading.Lock()
+
+
 def log_access(method: str, path: str, status: int) -> None:
-    print(
-        f"[{dt.datetime.now().isoformat(timespec='seconds')}] {method} {path} -> {status}",
-        flush=True,
-    )
+    # Self-managed access log with size rotation: under launchd the stdout
+    # fd is held open, so the server must own its log file to rotate it.
+    line = f"[{dt.datetime.now().isoformat(timespec='seconds')}] {method} {path} -> {status}\n"
+    with _access_lock:
+        try:
+            if (
+                ACCESS_LOG_FILE.exists()
+                and ACCESS_LOG_FILE.stat().st_size > ACCESS_LOG_MAX_BYTES
+            ):
+                LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+                ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                ACCESS_LOG_FILE.rename(LOG_ARCHIVE_DIR / f"ip_monitor_server.log.{ts}")
+            with open(ACCESS_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 def guard_status() -> dict:
@@ -437,6 +511,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, guard_events(limit))
             return
 
+        if path == "/api/global-egress":
+            query = urllib.parse.parse_qs(parsed.query)
+            force = query.get("force", ["0"])[0] == "1"
+            self._send_json(200, global_egress(force))
+            return
+
         if path.startswith("/api/clash/"):
             target = "/" + path[len("/api/clash/"):]
             if target not in CLASH_GET_WHITELIST:
@@ -460,15 +540,73 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+def tailscale_ipv4() -> str | None:
+    """Find this machine's Tailscale IPv4 (CGNAT 100.64.0.0/10) via ifconfig."""
+    try:
+        out = subprocess.run(
+            ["/sbin/ifconfig"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except OSError:
+        return None
+    for m in re.finditer(r"inet (100\.\d{1,3}\.\d{1,3}\.\d{1,3})", out):
+        try:
+            if ipaddress.ip_address(m.group(1)) in ipaddress.ip_network("100.64.0.0/10"):
+                return m.group(1)
+        except ValueError:
+            continue
+    return None
+
+
+def serve_on(host: str, port: int) -> ThreadingHTTPServer | None:
+    try:
+        httpd = ThreadingHTTPServer((host, port), Handler)
+    except OSError as exc:
+        print(f"Cockpit bind failed on {host}:{port}: {exc}", flush=True)
+        return None
+    t = threading.Thread(target=httpd.serve_forever, daemon=True, name=f"serve-{host}")
+    t.start()
+    print(f"Cockpit listening on http://{host}:{port}", flush=True)
+    return httpd
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cockpit local web server")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="single bind address (debug). Default: 127.0.0.1 + Tailscale interface when present",
+    )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    with ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
-        print(f"Cockpit running at http://{args.host}:{args.port}", flush=True)
-        httpd.serve_forever()
+    if args.host:
+        if serve_on(args.host, args.port) is None:
+            raise SystemExit(1)
+        threading.Event().wait()
+        return
+
+    # Default mode: 127.0.0.1 always; Tailscale 100.x when present. NO other
+    # interfaces — LAN/public binds are out of scope by design (issue S6).
+    bound: set[str] = set()
+    if serve_on("127.0.0.1", args.port):
+        bound.add("127.0.0.1")
+    ts = tailscale_ipv4()
+    if ts and serve_on(ts, args.port):
+        bound.add(ts)
+
+    if not bound:
+        raise SystemExit("no address could be bound")
+
+    # Late-bind: at boot the LaunchAgent may start before Tailscale is up.
+    def late_bind() -> None:
+        while True:
+            time.sleep(60)
+            ts_now = tailscale_ipv4()
+            if ts_now and ts_now not in bound and serve_on(ts_now, args.port):
+                bound.add(ts_now)
+
+    threading.Thread(target=late_bind, daemon=True, name="late-bind").start()
+    threading.Event().wait()
 
 
 if __name__ == "__main__":

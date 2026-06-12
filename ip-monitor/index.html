@@ -160,7 +160,13 @@
       </table>
     </div>
   </div>
-  <div class="card placeholder"><h2>全局出口</h2><div class="coming">S6 上线</div></div>
+  <div class="card" id="egress-card">
+    <h2>全局出口（主代理链路）</h2>
+    <span class="badge gray" id="egress-badge">未探测</span>
+    <button class="btn-sm" id="egress-btn">探测</button>
+    <div class="kv" id="egress-sources"></div>
+    <div class="detail" id="egress-note"></div>
+  </div>
 </div>
 
 <footer>
@@ -354,6 +360,7 @@ async function refreshGuard() {
   else setBadge(meta.cls, meta.text);
   document.getElementById("guard-card").classList.toggle("flash-bad", g.status === "BLOCK" && !payload.stale);
 
+  guardExpectedIp = g.expected_ip || null;
   setText("g-expected", g.expected_ip || "—");
   setText("g-status", g.status);
   setText("g-path", PATH_LABEL[g.check_path] || g.check_path || "—");
@@ -471,6 +478,37 @@ async function refreshConns() {
     `${conns.length} 条连接` + (filter ? `（筛选: ${filter}）` : "") + ` · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
 }
 
+// ---- 全局出口（S6）：低频探测（服务端 60s 缓存），与家宽出口对照 ----
+let guardExpectedIp = null;
+
+async function refreshEgress(force) {
+  const badge = document.getElementById("egress-badge");
+  badge.className = "badge gray"; badge.textContent = "探测中…";
+  let d;
+  try { d = await getJSON("/api/global-egress" + (force ? "?force=1" : "")); }
+  catch (e) { badge.textContent = "探测请求失败"; return; }
+  const box = document.getElementById("egress-sources");
+  box.innerHTML = "";
+  for (const s of d.sources || []) {
+    const row = document.createElement("div");
+    row.innerHTML = `<span class="k">${s.name}</span><span class="v">` +
+      (s.ok ? `${s.ip} · ${s.latency_ms}ms` : `<span class="c-bad">${s.error || "失败"}</span>`) + `</span>`;
+    box.appendChild(row);
+  }
+  const note = document.getElementById("egress-note");
+  if (!d.ok) {
+    badge.className = "badge bad"; badge.textContent = "全局出口探测失败";
+    note.textContent = "两个探测源都失败：主代理链路可能异常（若仅 HTTPS 源失败，多为机场节点 TLS 问题）。";
+  } else if (guardExpectedIp && d.ip === guardExpectedIp) {
+    badge.className = "badge bad"; badge.textContent = d.ip + "（＝家宽 IP！）";
+    note.textContent = "全局出口不应等于家宽 IP——全局流量正在消耗家宽出口，检查规则/模式。";
+  } else {
+    badge.className = "badge ok"; badge.textContent = d.ip;
+    note.textContent = (d.cached ? "缓存结果 · " : "") + "探测于 " + (d.probed_at || "").replace("T", " ").replace(/\+.*$/, "") + "（经 MATCH 兜底规则，非 Claude 路径）";
+  }
+}
+document.getElementById("egress-btn").addEventListener("click", () => refreshEgress(true));
+
 document.getElementById("recheck-btn").addEventListener("click", async () => {
   const btn = document.getElementById("recheck-btn");
   btn.disabled = true; btn.textContent = "已触发…";
@@ -499,6 +537,7 @@ document.getElementById("conn-copy").addEventListener("click", async () => {
 });
 
 refreshGuard(); refreshClash(); refreshSubs(); refreshEvents(); refreshConns();
+setTimeout(() => refreshEgress(false), 800);
 setInterval(refreshGuard, 5000);
 setInterval(refreshClash, 5000);
 setInterval(refreshSubs, 60000);
