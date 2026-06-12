@@ -42,6 +42,7 @@ SOCK=/tmp/verge/verge-mihomo.sock
 | `~/Projects/clash-verge-ip-guard/skills/claude-ip-guard/scripts/claude-ip-heal.sh` | 同步 | git canonical 副本 |
 | `$APPDIR/profiles/mUTAPkE8C6o0.yaml` | 修改（Phase 2） | mitce merge：Codex-Stable 防抖 |
 | `$APPDIR/profiles.yaml` | UI 间接修改（Phase 2） | mitce `allow_auto_update: false` |
+| `$APPDIR/clash-verge-guard-expanded.yaml` | 生成（Phase 2/漂移修复时） | 展开 `prepend-*` 后给 mihomo reload |
 | `~/Scratch/20260610-clash-guard-rollback/` | 创建 | 回滚仓 |
 | `~/Archive/2026/clash-verge-bak-20260610/` | 创建 | 历史 .bak 归档 |
 
@@ -125,6 +126,8 @@ runtime_claude_rules_ok() {
   [[ "$rules" == *"claude.ai"* ]] || return 1
   [[ "$rules" == *"claude.com"* ]] || return 1
   [[ "$rules" == *"clau.de"* ]] || return 1
+  [[ "$rules" == *"claudeusercontent.com"* ]] || return 1
+  [[ "$rules" == *"claude.exe"* ]] || return 1
 }
 
 # Mode/TUN invariant: rules only apply in rule mode, and terminal traffic only
@@ -431,7 +434,28 @@ main() 内原文（lines 872-875）：
 
 理由：heal 的职责是修 Claude 固定 IP，不应该在慢速修复路径里改变全局出口。
 
-- [ ] **Step 5: 语法检查**
+- [ ] **Step 5: runtime 缺 Claude 组/规则时 reload 展开配置**
+
+在 `reload_core()` 前新增：
+
+```bash
+runtime_claude_needs_reload() { ... }
+write_expanded_runtime_config() { ... }
+```
+
+语义：
+
+- 检测运行时 `Claude` group 是否存在且包含 `Claude-Residential`。
+- 检测 Claude 域名规则、Claude Code 进程规则与 probe 规则是否存在；`claudeusercontent.com` 是 Claude Code bridge 流量，`claude.exe` 可访问 Datadog 等非 Claude 域名，二者都必须纳入 Claude 规则。
+- 如缺失，从 `$APPDIR/clash-verge.yaml` 生成 `$APPDIR/clash-verge-guard-expanded.yaml`：
+  展开 `prepend-proxies`、`prepend-proxy-groups`、`prepend-rules`，移除 `append-*`/`prepend-*`
+  merge 键，再交给 mihomo reload。
+- 展开时同步给 `Codex-Stable` 写入 `interval: 300`、`lazy: true`、`max-failed-times: 3`。
+
+理由：mihomo 不理解 Clash Verge 的 `prepend-*` merge 键。直接把带 `prepend-*` 的
+`clash-verge.yaml` 交给 mihomo 会导致运行时缺 Claude 组/规则。
+
+- [ ] **Step 6: 语法检查**
 
 ```bash
 bash -n ~/Projects/clash-verge/skills/claude-ip-guard/scripts/claude-ip-heal.sh && echo SYNTAX-OK
@@ -439,7 +463,7 @@ bash -n ~/Projects/clash-verge/skills/claude-ip-guard/scripts/claude-ip-heal.sh 
 
 Expected: `SYNTAX-OK`
 
-- [ ] **Step 6: 手动跑一次 heal 验证幂等**
+- [ ] **Step 7: 手动跑一次 heal 验证幂等/漂移修复**
 
 ```bash
 ~/.local/bin/claude-ip-heal "$EXP_IP" "$EXP_PORT"; echo "exit=$?"
@@ -447,7 +471,7 @@ Expected: `SYNTAX-OK`
 
 Expected: `exit=0`；输出中**没有** `injected-claude-core`/`injected-doggo-fallback`/`hardened:` 指向 `clash-verge.yaml` 或 `clash-verge-check.yaml` 的行；出现 `core reload skipped (no on-disk change this run)`；最后 `OK: static residential IP restored`；没有新增 `egress switch` 行。
 
-- [ ] **Step 7: Claude 运行时复核（红线检查）**
+- [ ] **Step 8: Claude 运行时复核（红线检查）**
 
 ```bash
 curl --unix-socket "$SOCK" -s http://localhost/proxies/Claude | python3 -c "import json,sys; print(json.load(sys.stdin)['now'])"
@@ -619,9 +643,10 @@ Expected: `YAML-OK`。此时只改了磁盘文件，运行时尚未受影响。
 
 1. Claude 桌面端已退出；2. 所有 Claude Code CLI 会话已结束（本 session 除外，它走 `NO_PROXY` 不受影响——仍建议空闲）；3. Codex CLI 已退出。
 
-- [ ] **Step 2: master 在 Verge UI 关闭 mitce 订阅自动更新**
+- [ ] **Step 2: 关闭 mitce 订阅自动更新**
 
-操作：Clash Verge → 订阅页 → mitce 卡片右键/编辑 → 关闭「自动更新」开关。
+操作：优先用 Clash Verge UI 关闭；无人值守时可直接把 `$APPDIR/profiles.yaml` 中
+mitce profile（uid `RB69BA9kx9fv`）的 `option.allow_auto_update` 改为 `false`。
 
 验证：
 
@@ -638,7 +663,9 @@ Expected: `allow_auto_update = False`
 
 - [ ] **Step 3: master 点击 mitce profile 卡片重新激活（= 本窗口唯一一次 reload）**
 
-Verge 会从 profile + merge 源重新生成 `clash-verge.yaml` 并重载 core。这同时完成：merge 改动生效、运行时找回缺失的 5 条规则、清掉历史注入造成的重复定义。
+执行 `claude-ip-heal` 或等 enforcer 慢速路径生成 `$APPDIR/clash-verge-guard-expanded.yaml`
+并对该展开文件执行 `PUT /configs`。这同时完成：运行时找回 Claude 组、找回缺失的 probe
+规则、Codex-Stable 防抖进入运行时。
 
 ### Task 9: 验证门（全过才放行）
 

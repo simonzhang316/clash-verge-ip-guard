@@ -68,9 +68,12 @@
 - 修复 line 246 算术 bug（引号进入 `$(( ))` 导致 `set -e` 下整脚本崩溃）。
 - 控制流重构为「先查运行时不变量，再修」：
   1. 先检查 mihomo 运行时：socket 可达、mode == `rule`、TUN 开启、
-     `Claude` 组指向 `Claude-Residential`、Claude 域名规则存在、
+     `Claude` 组指向 `Claude-Residential`、Claude 域名规则与 Claude Code 进程规则存在
+     （含 `claudeusercontent.com`，否则 bridge 连接会落回通用代理）、
      住宅 SOCKS 本体出口 IP == `<EXPECTED_IP>`。
      这一步不依赖 `api.ipify.org` / `ip.sb` 等当前缺失的 probe 规则。
+     住宅 SOCKS 本体校验中，空响应/超时按检测源故障处理；至少 1 个源明确命中且没有源
+     明确返回非目标 IPv4，即可走 fast-path。
      mode/TUN 必须纳入不变量：global 模式回归会绕过全部 Claude 规则，
      而组指向/规则列表/SOCKS 本体三项检查在该状态下仍会通过（fail-open 洞）。
   2. 不变量正确 → 记录 `enforce OK (fast-path)`，**零写入、零 heal、零 reload、零 GLOBAL 切换**，退出。
@@ -86,6 +89,9 @@
   「目标字段值已正确则跳过」，消除与 Verge 的互写循环。
 - heal 的运行时修复只保留 Claude 必需项：rule mode、TUN enable、route exclude、Claude 组。
   不再设置 `主代理`、`狗狗加速.com`、`GLOBAL`。
+- 当运行时丢失 Claude 组或 Claude 规则时，heal 从 `clash-verge.yaml` 生成
+  `clash-verge-guard-expanded.yaml`：展开 Verge 的 `prepend-*` merge 键后再交给 mihomo
+  reload，避免 mihomo 直接忽略 `prepend-*` 导致 Claude 组/规则缺失。
 - `.bak` 活跃目录保留上限 20 份，超出部分移动归档；现存历史 `.bak` 归档至
   `~/Archive/2026/clash-verge-bak-20260610/`。
 
@@ -109,7 +115,8 @@ err 日志无新增报错。
      `PROCESS-NAME,curl` 规则恢复后会先于它匹配，把 enforcer fast-path 的
      SOCKS 本体直测拉进家宽自环；置顶恢复该规则本意，并使 fast-path 测试
      路径与 mihomo 拨家宽的真实路径一致。
-4. 一次 core reload，同步磁盘 ↔ 运行时（自然找回缺失的 5 条规则）。
+4. 一次 core reload，同步磁盘 ↔ 运行时；reload 输入为展开后的
+   `clash-verge-guard-expanded.yaml`，自然找回缺失的 Claude 组与 probe 规则。
 5. 验证门（全部通过才通知 master 可重开应用）：
    - Claude 运行时不变量正确，住宅 SOCKS 本体出口 IP == `<EXPECTED_IP>`。
    - 运行时规则数量与磁盘 merge 对账（含此前缺失的 5 条）。
@@ -142,7 +149,7 @@ err 日志无新增报错。
 | core reload 频率 | ~每 105 秒一次（日均数百次） | 日常 0 次（仅受控窗口 1 次） |
 | enforcer err 日志 | 每 30s 一条语法错误 | 零新增 |
 | `.bak` 增长 | 每小时新增 | 零增长 |
-| Claude 运行时不变量 | probe 规则缺失，fast-path 不可用 | Claude 组/规则/SOCKS 本体均正确 |
+| Claude 运行时不变量 | probe 规则缺失，fast-path 不可用 | Claude 组/规则/SOCKS 本体均正确，`claudeusercontent.com` 与 `claude.exe` 不外漏 |
 | 全局出口拨动 | 守护层频繁切 GLOBAL | 守护层 0 次切 GLOBAL |
 | Codex-Stable 防抖 | 偶发失败即可切换 | 连续失败才切换，不做测速优化 |
 | 体感 | 断流/爆红/告警频繁 | 24h 观察无断流，7 天复查 |
