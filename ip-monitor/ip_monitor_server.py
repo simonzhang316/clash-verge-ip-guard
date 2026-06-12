@@ -84,6 +84,7 @@ DELAY_THROTTLE_S = 30
 GROUP_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance"}
 
 _delay_last_test: dict[str, float] = {}
+_delay_lock = threading.Lock()
 
 
 def load_or_create_token() -> str:
@@ -146,11 +147,12 @@ def op_delay_test(payload: dict) -> tuple[int, dict]:
             "error": "claude_residential_protected",
             "hint": "该组包含家宽节点，禁止主动测速（ADR-0002）",
         }
-    now = time.monotonic()
-    last = _delay_last_test.get(group)
-    if last is not None and now - last < DELAY_THROTTLE_S:
-        return 429, {"error": "throttled", "retry_after_s": int(DELAY_THROTTLE_S - (now - last))}
-    _delay_last_test[group] = now
+    with _delay_lock:
+        now = time.monotonic()
+        last = _delay_last_test.get(group)
+        if last is not None and now - last < DELAY_THROTTLE_S:
+            return 429, {"error": "throttled", "retry_after_s": int(DELAY_THROTTLE_S - (now - last))}
+        _delay_last_test[group] = now
     q = urllib.parse.urlencode({"url": DELAY_TEST_URL, "timeout": DELAY_TEST_TIMEOUT_MS})
     status, result = mihomo_request(
         "GET", "/group/" + urllib.parse.quote(group) + "/delay?" + q, timeout=20.0
@@ -229,9 +231,15 @@ def op_recheck() -> tuple[int, dict]:
     return 200, {"ok": True, "hint": "enforcer 已触发，约 10 秒后刷新守护状态"}
 
 
-ACCESS_LOG_FILE = BASE_DIR / "ip_monitor_server.log"
+ACCESS_LOG_FILE = Path(
+    os.environ.get(
+        "COCKPIT_ACCESS_LOG",
+        str(Path.home() / ".local/log/ip_monitor_server.log"),
+    )
+)
 ACCESS_LOG_MAX_BYTES = 20 * 1024 * 1024
 LOG_ARCHIVE_DIR = Path.home() / ".local/log/archive"
+ACCESS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 _access_lock = threading.Lock()
 
 
@@ -290,8 +298,15 @@ def guard_status() -> dict:
 def guard_events(limit: int) -> dict:
     if not GUARD_EVENTS_JSONL.exists():
         return {"available": True, "events": []}
+    # Tail-read only: the enforcer appends without rotation, so never pull
+    # the whole file into memory. 256KB covers far more than the 500-line cap;
+    # a line truncated by the seek is dropped by the json.loads fallback.
     try:
-        lines = GUARD_EVENTS_JSONL.read_text(encoding="utf-8").splitlines()
+        with open(GUARD_EVENTS_JSONL, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError as exc:
         return {"available": False, "reason": f"events_unreadable_{type(exc).__name__}"}
     events = []
@@ -353,8 +368,6 @@ def profile_node_count(profile_file: Path) -> int | None:
     exactly one `server:` field and groups have none, so counting server
     fields (block + flow style) is the reliable signal.
     """
-    import re
-
     try:
         mtime = profile_file.stat().st_mtime
     except OSError:
@@ -401,7 +414,7 @@ def subscriptions() -> dict:
                 "is_current": item.get("uid") == current_uid,
                 "updated_ts": updated,
                 "updated_iso": (
-                    dt.datetime.fromtimestamp(updated).isoformat(timespec="seconds")
+                    dt.datetime.fromtimestamp(updated).astimezone().isoformat(timespec="seconds")
                     if isinstance(updated, (int, float))
                     else None
                 ),

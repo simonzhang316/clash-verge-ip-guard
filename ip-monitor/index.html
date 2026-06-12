@@ -187,6 +187,14 @@ const openGroups = new Set();
 
 function setText(id, v) { document.getElementById(id).textContent = v; }
 
+// 所有 innerHTML 模板里的外部字符串（mihomo 节点名/进程名/远端 host、
+// 订阅名、enforcer 事件详情）一律先过 esc()——机场订阅和 DNS 都能注入 HTML。
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
 function setBadge(cls, text) {
   const b = document.getElementById("guard-badge");
   b.className = "badge " + cls;
@@ -206,12 +214,17 @@ function getToken(forceAsk) {
 async function opPost(path, body) {
   let token = getToken(false);
   for (let attempt = 0; attempt < 2; attempt++) {
-    const r = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Cockpit-Token": token },
-      body: JSON.stringify(body || {}),
-    });
-    const data = await r.json();
+    let r, data;
+    try {
+      r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Cockpit-Token": token },
+        body: JSON.stringify(body || {}),
+      });
+      data = await r.json();
+    } catch (e) {
+      return { status: 0, data: { error: "network_error", hint: e.message } };
+    }
     if (r.status === 401 && attempt === 0) { token = getToken(true); continue; }
     return { status: r.status, data };
   }
@@ -228,8 +241,9 @@ async function delayTest(group, gtype, btn) {
   if ((gtype === "URLTest" || gtype === "Fallback") &&
       !confirm(`${group} 是 ${gtype} 自动选组：测速会刷新延迟排名，可能触发组内切换、影响长连接。继续？`)) return;
   btn.disabled = true; btn.textContent = "测速中…";
-  const r = await opPost("/api/ops/delay-test", { group });
-  btn.disabled = false; btn.textContent = "测速";
+  let r;
+  try { r = await opPost("/api/ops/delay-test", { group }); }
+  finally { btn.disabled = false; btn.textContent = "测速"; }
   if (r.status === 429) alert(`太频繁：${r.data.retry_after_s}s 后再试`);
   else if (r.status !== 200) alert(`测速失败: ${r.data.error}${r.data.hint ? "\n" + r.data.hint : ""}`);
   refreshClash();
@@ -271,9 +285,9 @@ function renderGroups(proxies) {
     const { delay } = delayInfo(proxies, name);
     const locked = name === "Claude" ? ' <span class="lock" title="守护层锁定，面板不可切（ADR-0002）">🔒</span>' : "";
     sum.innerHTML =
-      `<span class="gname">${name}${locked}</span>` +
-      `<span class="gtype">${g.type}</span>` +
-      `<span class="gnow">${g.now || "—"}</span>` +
+      `<span class="gname">${esc(name)}${locked}</span>` +
+      `<span class="gtype">${esc(g.type)}</span>` +
+      `<span class="gnow">${esc(g.now || "—")}</span>` +
       `<span class="ms"><span class="dot ${dotCls(delay)}"></span>${delay ? delay + " ms" : "—"}</span>`;
     // 测速按钮：Claude 锁定组与含家宽节点的组不提供（服务端同样拒绝）
     const testable = name !== "Claude" && !(g.all || []).includes("Claude-Residential");
@@ -294,7 +308,7 @@ function renderGroups(proxies) {
       const md = mh.length ? mh[mh.length - 1].delay : 0;
       const row = document.createElement("div");
       row.innerHTML =
-        `<span class="${m === g.now ? "cur" : ""}">${m}</span>` +
+        `<span class="${m === g.now ? "cur" : ""}">${esc(m)}</span>` +
         `<span class="ms"><span class="dot ${dotCls(md)}"></span>${md ? md + " ms" : "—"}</span>`;
       if (switchable && m !== g.now) {
         row.className = "switchable";
@@ -332,14 +346,15 @@ function renderSubs(payload) {
       : '<span class="badge ok sm">自动更新关</span>';
     const cur = p.is_current ? '<span class="badge ok sm">当前</span>' : "";
     div.innerHTML =
-      `<div class="row1"><b>${p.name || p.uid}</b>${cur}${autoBadge}</div>` +
-      `<div class="row2">${p.type} · 节点 ${p.node_count ?? "?"} · 间隔 ${p.update_interval_min ?? "—"} min · 更新于 ${(p.updated_iso || "—").replace("T", " ")}</div>`;
+      `<div class="row1"><b>${esc(p.name || p.uid)}</b>${cur}${autoBadge}</div>` +
+      `<div class="row2">${esc(p.type)} · 节点 ${esc(p.node_count ?? "?")} · 间隔 ${esc(p.update_interval_min ?? "—")} min · 更新于 ${esc((p.updated_iso || "—").replace("T", " "))}</div>`;
     box.appendChild(div);
   }
 }
 
 async function getJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
   return r.json();
 }
 
@@ -410,9 +425,9 @@ async function refreshEvents() {
       const row = document.createElement("div");
       row.className = "ev";
       row.innerHTML =
-        `<span class="ets">${(e.ts || "").replace("T", " ").replace(/\+.*$/, "")}</span>` +
-        `<span class="etag ${meta.cls}">${meta.tag}</span>` +
-        `<span class="edetail">${e.detail || ""}${e.backfill ? "（日志回填）" : ""}</span>`;
+        `<span class="ets">${esc((e.ts || "").replace("T", " ").replace(/\+.*$/, ""))}</span>` +
+        `<span class="etag ${meta.cls}">${esc(meta.tag)}</span>` +
+        `<span class="edetail">${esc(e.detail || "")}${e.backfill ? "（日志回填）" : ""}</span>`;
       box.appendChild(row);
     }
   } catch (e) {
@@ -432,8 +447,20 @@ function fmtRate(bps) {
   return (bps / 1048576).toFixed(1) + " M/s";
 }
 
+let connFetching = false;
+
 async function refreshConns() {
-  if (connPaused) return;
+  // in-flight guard：响应慢于 4s 轮询间隔时，避免旧响应覆盖新数据、污染速率差分
+  if (connPaused || connFetching) return;
+  connFetching = true;
+  try {
+    await refreshConnsInner();
+  } finally {
+    connFetching = false;
+  }
+}
+
+async function refreshConnsInner() {
   let payload;
   try { payload = await getJSON("/api/clash/connections"); }
   catch (e) { document.getElementById("conn-stat").textContent = "桥不可达"; return; }
@@ -466,9 +493,9 @@ async function refreshConns() {
     const tr = document.createElement("tr");
     if (risky) tr.className = "hl";
     tr.innerHTML =
-      `<td>${proc}</td><td>${md.network || "?"}</td><td>${dest}${port}</td>` +
-      `<td>${c.rule || ""}${c.rulePayload ? " " + c.rulePayload : ""}</td>` +
-      `<td>${chains}</td>` +
+      `<td>${esc(proc)}</td><td>${esc(md.network || "?")}</td><td>${esc(dest + port)}</td>` +
+      `<td>${esc((c.rule || "") + (c.rulePayload ? " " + c.rulePayload : ""))}</td>` +
+      `<td>${esc(chains)}</td>` +
       `<td class="num">${fmtRate(upRate)}</td><td class="num">${fmtRate(downRate)}</td>`;
     tbody.appendChild(tr);
     connLast.push({ process: proc, network: md.network, dest: dest + port, rule: (c.rule || "") + (c.rulePayload ? " " + c.rulePayload : ""), chains, upload: c.upload, download: c.download, start: c.start });
@@ -491,8 +518,8 @@ async function refreshEgress(force) {
   box.innerHTML = "";
   for (const s of d.sources || []) {
     const row = document.createElement("div");
-    row.innerHTML = `<span class="k">${s.name}</span><span class="v">` +
-      (s.ok ? `${s.ip} · ${s.latency_ms}ms` : `<span class="c-bad">${s.error || "失败"}</span>`) + `</span>`;
+    row.innerHTML = `<span class="k">${esc(s.name)}</span><span class="v">` +
+      (s.ok ? `${esc(s.ip)} · ${esc(s.latency_ms)}ms` : `<span class="c-bad">${esc(s.error || "失败")}</span>`) + `</span>`;
     box.appendChild(row);
   }
   const note = document.getElementById("egress-note");

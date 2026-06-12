@@ -23,16 +23,8 @@ if [[ -n "$OLD_PID" ]]; then
   sleep 0.5
 fi
 
-# Rotate the cockpit access log at restart if oversized (>20MB); the server
-# also self-rotates while running (issue S7).
-LOG="$BASE_DIR/ip_monitor_server.log"
-ARCHIVE_DIR="$HOME/.local/log/archive"
-if [[ -f "$LOG" && "$(/usr/bin/stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 20971520 ]]; then
-  /bin/mkdir -p "$ARCHIVE_DIR"
-  mv "$LOG" "$ARCHIVE_DIR/ip_monitor_server.log.$(date '+%Y%m%d-%H%M%S')" || true
-fi
-
 # Expected IP comes from the guard's state.json — no argument needed (ADR-0002).
+# Access log lives in ~/.local/log/ and is rotated by the server itself (S7).
 # Startup lines go to the launchd-style log; access log is self-managed by the server.
 /bin/mkdir -p "$HOME/.local/log"
 nohup python3 "$BASE_DIR/ip_monitor_server.py" --port "$PORT" \
