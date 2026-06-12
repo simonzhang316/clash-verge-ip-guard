@@ -1,2 +1,4 @@
 ip-monitor/ip_monitor_server.log
 ip-monitor/nohup.out
+__pycache__/
+*.pyc
