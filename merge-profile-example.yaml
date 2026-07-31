@@ -2,55 +2,67 @@
 # 位置：Clash Verge → Profiles → 对应订阅的 Merge 配置
 # 实际文件：~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/<uid>.yaml
 #
-# 本文件为脱敏版本，密码/用户名已替换为占位符。
+# 本文件为脱敏版本，与 2026-07-31 现役配置（mitce 订阅时代）同步。
+# IP/端口/用户名/密码均为占位符。
+#
+# 注意：现役另挂了一个 script（内容与本 merge 的 Codex-Stable 完全重复）。
+# merge+script 组合会触发 Verge 的 prepend 不展开 bug（靠 heal 每轮兜底）。
+# 新部署（含 Windows 迁移）一律只用 merge、不配 script。
 
 tcp-concurrent: true
 unified-delay: true
 
 prepend-proxies:
-  - { name: 'Claude-Residential', type: socks5, server: <YOUR_SOCKS5_IP>, port: <PORT>, username: <USERNAME>, password: <PASSWORD>, udp: true}
+  - { name: 'Claude-Residential', type: socks5, server: <YOUR_SOCKS5_IP>, port: <PORT>, username: <USERNAME>, password: <PASSWORD>, udp: true }
 
 prepend-proxy-groups:
   - name: Claude
     type: select
     proxies:
       - Claude-Residential
-      - REJECT
   - name: Codex-Stable
     type: fallback
     proxies:
+      - SG5-HY2
+      - SG4-HY2
       - JP2-HY2
-      - JP1-HY2
+      - JP4-HY2
       - JP3-HY2
-      - HK2-HY2
-      - HK3-HY2
+      - TW-2
+      - TW-4
+      - TW-7
+      - OpenAI
     url: 'https://chatgpt.com/cdn-cgi/trace'
-    interval: 600
+    interval: 300
     lazy: true
+    max-failed-times: 3
 
 prepend-rules:
-  # === 国内服务直连（不走代理）===
-  - 'DOMAIN-SUFFIX,feishu.cn,DIRECT'
-  - 'DOMAIN-SUFFIX,larksuite.com,DIRECT'
-  - 'DOMAIN-SUFFIX,larksuit.com,DIRECT'
-  - 'DOMAIN-SUFFIX,bytedance.com,DIRECT'
+  # 家宽 socks5 服务器本身直连，防回环
+  - 'IP-CIDR,<YOUR_SOCKS5_IP>/32,DIRECT,no-resolve'
 
-  # === Claude API 走家宽 IP ===
+  # === IP 探测域名走 Claude（用于校验出口）===
   - 'DOMAIN,ifconfig.me,Claude'
   - 'DOMAIN,api.ipify.org,Claude'
   - 'DOMAIN,ipv4.icanhazip.com,Claude'
   - 'DOMAIN-SUFFIX,ip.sb,Claude'
   - 'DOMAIN-SUFFIX,ping0.cc,Claude'
+
+  # === 进程级兜底（依赖 TUN；macOS=claude / curl，Windows=claude.exe / curl.exe）===
   - 'PROCESS-NAME,curl,Claude'
+  - 'PROCESS-NAME,claude.exe,Claude'
+  - 'PROCESS-NAME,claude,Claude'
+
+  # === Claude 全家桶钉死到家宽出口 ===
   - 'DOMAIN-SUFFIX,anthropic.com,Claude'
   - 'DOMAIN-SUFFIX,claude.ai,Claude'
   - 'DOMAIN-SUFFIX,claude.com,Claude'
   - 'DOMAIN-SUFFIX,clau.de,Claude'
+  - 'DOMAIN-SUFFIX,claudeusercontent.com,Claude'
   - 'DOMAIN-SUFFIX,modelcontextprotocol.io,Claude'
   - 'DOMAIN,anthropic.statuspage.io,Claude'
   - 'IP-CIDR,160.79.104.0/21,Claude,no-resolve'
   - 'IP-CIDR6,2607:6bc0::/48,Claude,no-resolve'
-  - 'IP-CIDR,<YOUR_SOCKS5_IP>/32,DIRECT,no-resolve'
 
   # === OpenAI / Codex 走稳定节点 ===
   - 'DOMAIN-SUFFIX,chatgpt.com,Codex-Stable'
