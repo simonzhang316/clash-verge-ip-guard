@@ -47,9 +47,15 @@ prepend-proxies:
   - { name: 'Claude-Residential', type: socks5, server: x.x.x.x, port: 443, username: xxx, password: xxx, udp: true, dialer-proxy: Claude-Tunnel }
 
 prepend-proxy-groups:
+  # Claude-Tunnel 成员是当前订阅的节点名(2026-08 mitce),换订阅时同步适配。
+  # fallback 自动容灾;实测第一跳选 SG(HK 出口到美西家宽端口不通,勿换 HK 优先)。
   - name: Claude-Tunnel
-    type: select
-    proxies: ['🇸🇬15新加坡-专线(AnyTLS)', '🇸🇬24新加坡-专线(AnyTLS)', '🇦🇺19澳洲-专线(AnyTLS)']
+    type: fallback
+    proxies: [SG5-HY2, SG4-HY2, JP2-HY2, JP3-HY2, JP4-HY2, 主代理]
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300
+    lazy: true
+    max-failed-times: 3
   - name: Claude
     type: select
     proxies: [Claude-Residential]
