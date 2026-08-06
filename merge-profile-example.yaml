@@ -2,7 +2,7 @@
 # 位置：Clash Verge → Profiles → 对应订阅的 Merge 配置
 # 实际文件：~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/<uid>.yaml
 #
-# 本文件为脱敏版本，与 2026-07-31 现役配置（mitce 订阅时代）同步。
+# 本文件为脱敏版本,与 2026-08-07 现役配置(mitce 订阅时代 + Claude-Tunnel 链式)同步。
 # IP/端口/用户名/密码均为占位符。
 #
 # 注意：现役另挂了一个 script（内容与本 merge 的 Codex-Stable 完全重复）。
@@ -13,9 +13,19 @@ tcp-concurrent: true
 unified-delay: true
 
 prepend-proxies:
-  - { name: 'Claude-Residential', type: socks5, server: <YOUR_SOCKS5_IP>, port: <PORT>, username: <USERNAME>, password: <PASSWORD>, udp: true }
+  # dialer-proxy: 家宽第一跳走机场 HY2 抗丢包隧道(跨境段),出口 IP 不变。
+  # 实测(2026-08-07): 直连家宽晚高峰建连失败率 28%(峰值90%),链式 0 失败;
+  # 第一跳必须 SG(HK 出口到美西家宽端口不通)。
+  - { name: 'Claude-Residential', type: socks5, server: <YOUR_SOCKS5_IP>, port: <PORT>, username: <USERNAME>, password: <PASSWORD>, udp: true, dialer-proxy: Claude-Tunnel }
 
 prepend-proxy-groups:
+  - name: Claude-Tunnel
+    type: fallback
+    proxies: [SG5-HY2, SG4-HY2, JP2-HY2, JP3-HY2, JP4-HY2, 主代理]
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300
+    lazy: true
+    max-failed-times: 3
   - name: Claude
     type: select
     proxies:
