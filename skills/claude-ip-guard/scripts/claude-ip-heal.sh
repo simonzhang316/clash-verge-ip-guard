@@ -176,7 +176,6 @@ prepend-proxy-groups:
     type: select
     proxies:
       - Claude-Residential
-      - REJECT
 
 prepend-rules:
   - 'DOMAIN,ifconfig.me,Claude'
@@ -185,10 +184,13 @@ prepend-rules:
   - 'DOMAIN,ipv4.icanhazip.com,Claude'
   - 'DOMAIN-SUFFIX,ip.sb,Claude'
   - 'PROCESS-NAME,curl,Claude'
+  - 'PROCESS-NAME,claude.exe,Claude'
+  - 'PROCESS-NAME,claude,Claude'
   - 'DOMAIN-SUFFIX,anthropic.com,Claude'
   - 'DOMAIN-SUFFIX,claude.ai,Claude'
   - 'DOMAIN-SUFFIX,claude.com,Claude'
   - 'DOMAIN-SUFFIX,clau.de,Claude'
+  - 'DOMAIN-SUFFIX,claudeusercontent.com,Claude'
   - 'DOMAIN-SUFFIX,modelcontextprotocol.io,Claude'
   - 'DOMAIN,anthropic.statuspage.io,Claude'
   - 'IP-CIDR,160.79.104.0/21,Claude,no-resolve'
@@ -277,7 +279,6 @@ ensure_full_config_has_claude() {
       print "  type: select"
       print "  proxies:"
       print "  - Claude-Residential"
-      print "  - REJECT"
       inserted_group = 1
     }
 
@@ -290,10 +291,13 @@ ensure_full_config_has_claude() {
       print "- DOMAIN,ipv4.icanhazip.com,Claude"
       print "- DOMAIN-SUFFIX,ip.sb,Claude"
       print "- PROCESS-NAME,curl,Claude"
+      print "- PROCESS-NAME,claude.exe,Claude"
+      print "- PROCESS-NAME,claude,Claude"
       print "- DOMAIN-SUFFIX,anthropic.com,Claude"
       print "- DOMAIN-SUFFIX,claude.ai,Claude"
       print "- DOMAIN-SUFFIX,claude.com,Claude"
       print "- DOMAIN-SUFFIX,clau.de,Claude"
+      print "- DOMAIN-SUFFIX,claudeusercontent.com,Claude"
       print "- DOMAIN-SUFFIX,modelcontextprotocol.io,Claude"
       print "- DOMAIN,anthropic.statuspage.io,Claude"
       print "- IP-CIDR,160.79.104.0/21,Claude,no-resolve"
@@ -571,10 +575,12 @@ harden_file() {
     }
 
     # Remove conflicting Claude-domain routes that may send traffic to non-Claude groups.
-    if (index(line, "DOMAIN-SUFFIX,anthropic.com,🔥ChatGPT") > 0 ||
-        index(line, "DOMAIN-SUFFIX,claude.ai,🔥ChatGPT") > 0 ||
-        index(line, "DOMAIN-SUFFIX,claude.com,🔥ChatGPT") > 0 ||
-        index(line, "DOMAIN-SUFFIX,clau.de,🔥ChatGPT") > 0) {
+    clean = line
+    sub(/^[[:space:]]*-[[:space:]]*'\''?/, "", clean)
+    sub(/'\''?[[:space:]]*$/, "", clean)
+    if ((clean ~ /^(DOMAIN|DOMAIN-SUFFIX),(anthropic\.com|claude\.ai|claude\.com|clau\.de|claudeusercontent\.com|modelcontextprotocol\.io|anthropic\.statuspage\.io),/ ||
+         clean ~ /^IP-CIDR6?,(160\.79\.104\.0\/21|2607:6bc0::\/48),/) &&
+        clean !~ /,Claude(,|$)/) {
       next
     }
 
@@ -670,11 +676,11 @@ harden_file() {
      /$1- PROCESS-NAME,curl,Claude\n/sx
   ' "$tmp"
 
-  # Keep fail-closed option available in Claude selector.
+  # Keep Claude selector locked to the static residential endpoint.
   perl -0777 -i -pe '
     s/(name:\s*Claude\s*\n\s*type:\s*select\s*\n\s*proxies:\s*\n\s*-\s*Claude-Residential\s*\n)
-      (?!\s*-\s*REJECT\s*\n)
-     /$1  - REJECT\n/sx
+      \s*-\s*REJECT\s*\n
+     /$1/sx
   ' "$tmp"
 
   # Ensure the residential endpoint bypasses TUN routing recursion.
@@ -703,23 +709,158 @@ harden_file() {
   fi
 }
 
+archive_old_baks() {
+  local src keep=20 archive="${BAK_ARCHIVE:-$HOME/Archive/2026/clash-verge-bak-20260610}"
+  local baks
+  /bin/mkdir -p "$archive"
+  for src in "$BASE"/*.yaml "$BASE"/profiles/*.yaml; do
+    [[ -f "$src" ]] || continue
+    baks="$(ls -t "$src".bak-* 2>/dev/null || true)"
+    [[ -n "$baks" ]] || continue
+    printf '%s\n' "$baks" | tail -n +$((keep + 1)) | while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      mv "$f" "$archive/" 2>/dev/null || true
+    done
+  done
+}
+
+runtime_claude_needs_reload() {
+  local group rules
+  [[ -S "$SOCK" ]] || return 1
+
+  group="$(api_get_proxy_group "Claude" 2>/dev/null || true)"
+  [[ "$group" == *"Claude-Residential"* ]] || return 0
+
+  rules="$(curl --unix-socket "$SOCK" -s http://localhost/rules 2>/dev/null || true)"
+  [[ "$rules" == *"anthropic.com"* ]] || return 0
+  [[ "$rules" == *"claude.ai"* ]] || return 0
+  [[ "$rules" == *"claude.com"* ]] || return 0
+  [[ "$rules" == *"clau.de"* ]] || return 0
+  [[ "$rules" == *"claudeusercontent.com"* ]] || return 0
+  [[ "$rules" == *"api.ipify.org"* ]] || return 0
+  [[ "$rules" == *"ipv4.icanhazip.com"* ]] || return 0
+  [[ "$rules" == *"ip.sb"* ]] || return 0
+  [[ "$rules" == *"claude.exe"* ]] || return 0
+  return 1
+}
+
+write_expanded_runtime_config() {
+  local src="$BASE/clash-verge.yaml"
+  local dst="$BASE/clash-verge-guard-expanded.yaml"
+  [[ -f "$src" ]] || return 1
+
+  /usr/bin/python3 - "$src" "$dst" "$TARGET_IP" <<'PY'
+import sys
+import yaml
+
+src, dst, target_ip = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src) as f:
+    data = yaml.safe_load(f)
+
+prepend_proxies = data.pop("prepend-proxies", []) or []
+prepend_groups = data.pop("prepend-proxy-groups", []) or []
+prepend_rules = data.pop("prepend-rules", []) or []
+data.pop("append-proxies", None)
+data.pop("append-proxy-groups", None)
+data.pop("append-rules", None)
+
+proxies = data.get("proxies") or []
+groups = data.get("proxy-groups") or []
+rules = data.get("rules") or []
+
+proxy_names = {p.get("name") for p in proxies if isinstance(p, dict)}
+group_names = {g.get("name") for g in groups if isinstance(g, dict)}
+
+data["proxies"] = [p for p in prepend_proxies if isinstance(p, dict) and p.get("name") not in proxy_names] + proxies
+merged_groups = [g for g in prepend_groups if isinstance(g, dict) and g.get("name") not in group_names] + groups
+merged_rules = [r for r in prepend_rules if r not in rules] + rules
+
+claude_rules = [
+    f"IP-CIDR,{target_ip}/32,DIRECT,no-resolve",
+    "DOMAIN,ifconfig.me,Claude",
+    "DOMAIN,api.ipify.org,Claude",
+    "DOMAIN,ipv4.icanhazip.com,Claude",
+    "DOMAIN-SUFFIX,ip.sb,Claude",
+    "DOMAIN-SUFFIX,ping0.cc,Claude",
+    "PROCESS-NAME,curl,Claude",
+    "PROCESS-NAME,claude.exe,Claude",
+    "PROCESS-NAME,claude,Claude",
+    "DOMAIN-SUFFIX,anthropic.com,Claude",
+    "DOMAIN-SUFFIX,claude.ai,Claude",
+    "DOMAIN-SUFFIX,claude.com,Claude",
+    "DOMAIN-SUFFIX,clau.de,Claude",
+    "DOMAIN-SUFFIX,claudeusercontent.com,Claude",
+    "DOMAIN-SUFFIX,modelcontextprotocol.io,Claude",
+    "DOMAIN,anthropic.statuspage.io,Claude",
+    "IP-CIDR,160.79.104.0/21,Claude,no-resolve",
+    "IP-CIDR6,2607:6bc0::/48,Claude,no-resolve",
+]
+
+def is_claude_rule(rule):
+    text = str(rule)
+    return any(term in text for term in [
+        target_ip,
+        "Claude-Fast",
+        "anthropic.com",
+        "claude.ai",
+        "claude.com",
+        "clau.de",
+        "claudeusercontent.com",
+        "modelcontextprotocol.io",
+        "anthropic.statuspage.io",
+        "api.ipify.org",
+        "ipv4.icanhazip.com",
+        "ifconfig.me",
+        "ping0.cc",
+        "ip.sb",
+        "PROCESS-NAME,claude.exe",
+        "PROCESS-NAME,claude",
+    ])
+
+clean_groups = []
+inserted_claude = False
+for group in merged_groups:
+    if isinstance(group, dict) and group.get("name") in {"Claude", "Claude-Fast"}:
+        if not inserted_claude:
+            clean_groups.append({"name": "Claude", "type": "select", "proxies": ["Claude-Residential"]})
+            inserted_claude = True
+        continue
+    clean_groups.append(group)
+if not inserted_claude:
+    clean_groups.insert(0, {"name": "Claude", "type": "select", "proxies": ["Claude-Residential"]})
+
+data["proxy-groups"] = clean_groups
+data["rules"] = claude_rules + [r for r in merged_rules if not is_claude_rule(r)]
+
+for group in data["proxy-groups"]:
+    if isinstance(group, dict) and group.get("name") == "Codex-Stable":
+        group["interval"] = 300
+        group["lazy"] = True
+        group["max-failed-times"] = 3
+
+with open(dst, "w") as f:
+    yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+PY
+
+  printf '%s' "$dst"
+}
+
 reload_core() {
   if [[ ! -S "$SOCK" ]]; then
     warn "clash socket not found at $SOCK; skip runtime reload"
     return 0
   fi
 
-  # Only do a full PUT-reload of clash-verge.yaml when this run actually
-  # modified one of the on-disk configs. Otherwise the reload is a no-op
-  # that still leaks memory inside mihomo (known hot-reload leakage when
-  # sniffer/TUN/DNS:53 are all enabled). The lightweight PATCH calls below
-  # are still issued every run to keep mode/tun/route-exclude correct.
-  if [[ "${HEAL_CHANGED:-0}" -gt 0 ]]; then
-    local core_cfg="$BASE/clash-verge.yaml"
-    if [[ -f "$core_cfg" ]]; then
+  # Do a full reload only when source files changed or runtime lost the Claude
+  # guard invariants. Use an expanded config because mihomo does not understand
+  # Clash Verge's prepend-* merge keys directly.
+  if [[ "${HEAL_CHANGED:-0}" -gt 0 ]] || runtime_claude_needs_reload; then
+    local core_cfg
+    core_cfg="$(write_expanded_runtime_config || true)"
+    if [[ -n "$core_cfg" && -f "$core_cfg" ]]; then
       curl --unix-socket "$SOCK" -s -X PUT -H 'Content-Type: application/json' \
         -d "{\"path\":\"$core_cfg\",\"force\":true}" http://localhost/configs >/dev/null || true
-      log "core reloaded (HEAL_CHANGED=$HEAL_CHANGED)"
+      log "core reloaded (HEAL_CHANGED=$HEAL_CHANGED, expanded-runtime)"
     fi
   else
     log "core reload skipped (no on-disk change this run)"
@@ -743,15 +884,6 @@ reload_core() {
 
   # Ensure Claude group points to Claude-Residential
   set_proxy_group_choice "Claude" "Claude-Residential" || true
-
-  # Main egress preference: mitce first (主代理), doggo as auxiliary.
-  set_proxy_group_choice "主代理" "自动选择" || true
-  set_proxy_group_choice "狗狗加速.com" "♻️自动选择" || true
-
-  # Fallback when mitce group is absent in the currently loaded profile.
-  if ! set_proxy_group_choice "GLOBAL" "主代理"; then
-    set_proxy_group_choice "GLOBAL" "狗狗加速.com" || true
-  fi
 }
 
 patch_profiles_state() {
@@ -772,8 +904,7 @@ patch_profiles_state() {
   if ! cmp -s "$file" "$tmp"; then
     cp "$file" "$file.bak-$TS"
     mv "$tmp" "$file"
-    log "state-updated: $file"
-    HEAL_CHANGED=$((HEAL_CHANGED + 1))
+    log "state-updated: $file (verge ui-state only, no core reload needed)"
   else
     rm -f "$tmp"
     log "state-no-change: $file"
@@ -850,9 +981,10 @@ main() {
 
   ensure_empty_merge_templates_have_claude
 
+  # clash-verge.yaml / clash-verge-check.yaml are Verge-generated artifacts.
+  # Mutating them here can fight Verge regeneration and force repeated core
+  # reloads. Only mutate source profile files; runtime repair happens below.
   local files=()
-  [[ -f "$BASE/clash-verge.yaml" ]] && files+=("$BASE/clash-verge.yaml")
-  [[ -f "$BASE/clash-verge-check.yaml" ]] && files+=("$BASE/clash-verge-check.yaml")
   if [[ -d "$BASE/profiles" ]]; then
     while IFS= read -r f; do files+=("$f"); done < <(list_yaml_files "$BASE/profiles")
   fi
@@ -870,6 +1002,7 @@ main() {
   done
 
   patch_profiles_state
+  archive_old_baks
   reload_core
   sleep 1
   check_ip
