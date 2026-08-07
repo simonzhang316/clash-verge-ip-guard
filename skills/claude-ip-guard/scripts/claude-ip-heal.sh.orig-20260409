@@ -41,56 +41,6 @@ file_matches_regex() {
   fi
 }
 
-is_ipv4() {
-  local ip="$1"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  local o
-  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
-  for o in "$o1" "$o2" "$o3" "$o4"; do
-    [[ "$o" =~ ^[0-9]+$ ]] || return 1
-    ((o >= 0 && o <= 255)) || return 1
-  done
-}
-
-extract_ipv4() {
-  local raw="$1"
-  local ip
-  if has_cmd rg; then
-    ip="$(printf '%s' "$raw" | rg -o -m1 '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)"
-  else
-    ip="$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1 || true)"
-  fi
-  printf '%s' "$ip"
-}
-
-probe_ip_direct() {
-  local raw ip url
-  for url in "$@"; do
-    raw="$(curl -4 -s --max-time 10 "$url" || true)"
-    ip="$(extract_ipv4 "$raw")"
-    if is_ipv4 "$ip"; then
-      printf '%s' "$ip"
-      return 0
-    fi
-  done
-  return 1
-}
-
-probe_ip_via_socks() {
-  local proxy_auth="$1"
-  shift
-  local raw ip url
-  for url in "$@"; do
-    raw="$(curl -4 -s --max-time 12 --socks5-hostname "$proxy_auth" "$url" || true)"
-    ip="$(extract_ipv4 "$raw")"
-    if is_ipv4 "$ip"; then
-      printf '%s' "$ip"
-      return 0
-    fi
-  done
-  return 1
-}
-
 list_yaml_files() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
@@ -165,36 +115,27 @@ ensure_empty_merge_templates_have_claude() {
     file_contains "Claude-Residential" "$f" && continue
 
     cp "$f" "$f.bak-$TS"
-    # bootstrap 产物是保底直连版:剥掉 dialer-proxy(链式引用订阅组名,灾难恢复
-    # 场景下订阅未知,带上会造成组引用断链);常规链式态由 merge 源 + Verge 管理
-    local proxy_map_bare
-    proxy_map_bare="$(printf '%s' "$proxy_map" | sed -E 's/,[[:space:]]*dialer-proxy:[[:space:]]*[^,}]+//')"
     cat > "$f" <<EOF
 # Profile Enhancement Merge Template for Clash Verge
 
 prepend-proxies:
-  - $proxy_map_bare
+  - $proxy_map
 
 prepend-proxy-groups:
   - name: Claude
     type: select
     proxies:
       - Claude-Residential
+      - REJECT
 
 prepend-rules:
   - 'DOMAIN,ifconfig.me,Claude'
   - 'DOMAIN-SUFFIX,ping0.cc,Claude'
-  - 'DOMAIN,api.ipify.org,Claude'
-  - 'DOMAIN,ipv4.icanhazip.com,Claude'
-  - 'DOMAIN-SUFFIX,ip.sb,Claude'
   - 'PROCESS-NAME,curl,Claude'
-  - 'PROCESS-NAME,claude.exe,Claude'
-  - 'PROCESS-NAME,claude,Claude'
   - 'DOMAIN-SUFFIX,anthropic.com,Claude'
   - 'DOMAIN-SUFFIX,claude.ai,Claude'
   - 'DOMAIN-SUFFIX,claude.com,Claude'
   - 'DOMAIN-SUFFIX,clau.de,Claude'
-  - 'DOMAIN-SUFFIX,claudeusercontent.com,Claude'
   - 'DOMAIN-SUFFIX,modelcontextprotocol.io,Claude'
   - 'DOMAIN,anthropic.statuspage.io,Claude'
   - 'IP-CIDR,160.79.104.0/21,Claude,no-resolve'
@@ -283,6 +224,7 @@ ensure_full_config_has_claude() {
       print "  type: select"
       print "  proxies:"
       print "  - Claude-Residential"
+      print "  - REJECT"
       inserted_group = 1
     }
 
@@ -291,17 +233,11 @@ ensure_full_config_has_claude() {
     if ($0 ~ /^rules:[[:space:]]*$/ && has_rule == 0 && inserted_rule == 0) {
       print "- DOMAIN,ifconfig.me,Claude"
       print "- DOMAIN-SUFFIX,ping0.cc,Claude"
-      print "- DOMAIN,api.ipify.org,Claude"
-      print "- DOMAIN,ipv4.icanhazip.com,Claude"
-      print "- DOMAIN-SUFFIX,ip.sb,Claude"
       print "- PROCESS-NAME,curl,Claude"
-      print "- PROCESS-NAME,claude.exe,Claude"
-      print "- PROCESS-NAME,claude,Claude"
       print "- DOMAIN-SUFFIX,anthropic.com,Claude"
       print "- DOMAIN-SUFFIX,claude.ai,Claude"
       print "- DOMAIN-SUFFIX,claude.com,Claude"
       print "- DOMAIN-SUFFIX,clau.de,Claude"
-      print "- DOMAIN-SUFFIX,claudeusercontent.com,Claude"
       print "- DOMAIN-SUFFIX,modelcontextprotocol.io,Claude"
       print "- DOMAIN,anthropic.statuspage.io,Claude"
       print "- IP-CIDR,160.79.104.0/21,Claude,no-resolve"
@@ -315,7 +251,6 @@ ensure_full_config_has_claude() {
   if ! cmp -s "$file" "$tmp"; then
     mv "$tmp" "$file"
     log "injected-claude-core: $file"
-    HEAL_CHANGED=$((HEAL_CHANGED + 1))
   else
     rm -f "$tmp"
   fi
@@ -467,7 +402,6 @@ ensure_full_config_has_doggo_fallback() {
   if ! cmp -s "$file" "$tmp"; then
     mv "$tmp" "$file"
     log "injected-doggo-fallback: $file"
-    HEAL_CHANGED=$((HEAL_CHANGED + 1))
   else
     rm -f "$tmp"
   fi
@@ -480,6 +414,7 @@ patch_file() {
     return 0
   fi
 
+  cp "$file" "$file.bak-$TS"
   local tmp
   tmp="$(mktemp)"
 
@@ -489,10 +424,11 @@ patch_file() {
     line = $0
 
     # Inline map style: { name: "Claude-Residential", server: ..., port: ..., ... }
-    # dialer-proxy(Claude-Tunnel 链式)是常规态,heal 只纠 server/port,不拆链式
-    if (line ~ /Claude-Residential/ && line ~ /server:[^,}]+/ && line ~ /port:[[:space:]]*[0-9]+/) {
+    if (line ~ /Claude-Residential/ && line ~ /server:[^,}]+/ && line ~ /port:[0-9]+/) {
       gsub(/server:[[:space:]]*[^,}]+/, "server: " ip, line)
       gsub(/port:[[:space:]]*[0-9]+/, "port: " port, line)
+      gsub(/,[[:space:]]*dialer-proxy:[[:space:]]*\x27?Claude-Tunnel\x27?/, "", line)
+      gsub(/,[[:space:]]*dialer-proxy:[[:space:]]*\"?Claude-Tunnel\"?/, "", line)
       print line
       next
     }
@@ -529,6 +465,10 @@ patch_file() {
         print line
         next
       }
+      if ($0 ~ /^[[:space:]]*dialer-proxy:[[:space:]]*\x27?Claude-Tunnel\x27?[[:space:]]*$/ ||
+          $0 ~ /^[[:space:]]*dialer-proxy:[[:space:]]*\"?Claude-Tunnel\"?[[:space:]]*$/) {
+        next
+      }
     }
 
     print line
@@ -536,10 +476,8 @@ patch_file() {
   ' "$file" > "$tmp"
 
   if ! cmp -s "$file" "$tmp"; then
-    cp "$file" "$file.bak-$TS"
     mv "$tmp" "$file"
     log "patched: $file"
-    HEAL_CHANGED=$((HEAL_CHANGED + 1))
   else
     rm -f "$tmp"
     log "no-change: $file"
@@ -555,15 +493,8 @@ harden_file() {
   awk -v ip="$TARGET_IP" '
   BEGIN {
     direct_rule = "IP-CIDR," ip "/32,DIRECT,no-resolve"
-    monitor_rule_1 = "DOMAIN,api.ipify.org,Claude"
-    monitor_rule_2 = "DOMAIN,ipv4.icanhazip.com,Claude"
-    monitor_rule_3 = "DOMAIN-SUFFIX,ip.sb,Claude"
     seen_direct = 0
     seen_curl = 0
-    seen_monitor_1 = 0
-    seen_monitor_2 = 0
-    seen_monitor_3 = 0
-    inserted_monitor = 0
   }
   {
     line = $0
@@ -574,12 +505,10 @@ harden_file() {
     }
 
     # Remove conflicting Claude-domain routes that may send traffic to non-Claude groups.
-    clean = line
-    sub(/^[[:space:]]*-[[:space:]]*'\''?/, "", clean)
-    sub(/'\''?[[:space:]]*$/, "", clean)
-    if ((clean ~ /^(DOMAIN|DOMAIN-SUFFIX),(anthropic\.com|claude\.ai|claude\.com|clau\.de|claudeusercontent\.com|modelcontextprotocol\.io|anthropic\.statuspage\.io),/ ||
-         clean ~ /^IP-CIDR6?,(160\.79\.104\.0\/21|2607:6bc0::\/48),/) &&
-        clean !~ /,Claude(,|$)/) {
+    if (index(line, "DOMAIN-SUFFIX,anthropic.com,🔥ChatGPT") > 0 ||
+        index(line, "DOMAIN-SUFFIX,claude.ai,🔥ChatGPT") > 0 ||
+        index(line, "DOMAIN-SUFFIX,claude.com,🔥ChatGPT") > 0 ||
+        index(line, "DOMAIN-SUFFIX,clau.de,🔥ChatGPT") > 0) {
       next
     }
 
@@ -603,41 +532,8 @@ harden_file() {
       if (seen_curl) next
       seen_curl = 1
     }
-    if (index(line, monitor_rule_1) > 0) {
-      if (seen_monitor_1) next
-      seen_monitor_1 = 1
-    }
-    if (index(line, monitor_rule_2) > 0) {
-      if (seen_monitor_2) next
-      seen_monitor_2 = 1
-    }
-    if (index(line, monitor_rule_3) > 0) {
-      if (seen_monitor_3) next
-      seen_monitor_3 = 1
-    }
 
     print line
-
-    # Ensure monitor domains route through Claude in rule mode.
-    if (!inserted_monitor &&
-        (index(line, "DOMAIN-SUFFIX,ping0.cc,Claude") > 0 ||
-         index(line, "DOMAIN,ifconfig.me,Claude") > 0)) {
-      match(line, /^[[:space:]]*/)
-      indent = substr(line, 1, RLENGTH)
-      if (line ~ /'\''[[:space:]]*$/) {
-        if (!seen_monitor_1) print indent "- '\''" monitor_rule_1 "'\''"
-        if (!seen_monitor_2) print indent "- '\''" monitor_rule_2 "'\''"
-        if (!seen_monitor_3) print indent "- '\''" monitor_rule_3 "'\''"
-      } else {
-        if (!seen_monitor_1) print indent "- " monitor_rule_1
-        if (!seen_monitor_2) print indent "- " monitor_rule_2
-        if (!seen_monitor_3) print indent "- " monitor_rule_3
-      }
-      seen_monitor_1 = 1
-      seen_monitor_2 = 1
-      seen_monitor_3 = 1
-      inserted_monitor = 1
-    }
 
     # Ensure curl-based checks are always routed into Claude group.
     if (!seen_curl && index(line, "DOMAIN-SUFFIX,ping0.cc,Claude") > 0) {
@@ -665,183 +561,42 @@ harden_file() {
   }
   ' "$file" > "$tmp"
 
-  # Apply the remaining perl transforms to the tmp copy (NOT the original),
-  # so we can compare-and-swap atomically and only write/.bak when something changed.
+  if ! cmp -s "$file" "$tmp"; then
+    mv "$tmp" "$file"
+    log "hardened: $file"
+  else
+    rm -f "$tmp"
+    log "already-hardened: $file"
+  fi
 
   # Ensure curl rule exists in the effective final rules block.
   perl -0777 -i -pe '
     s/(rules:\n- DOMAIN,ifconfig\.me,Claude\n- DOMAIN-SUFFIX,ping0\.cc,Claude\n)
       (?!- PROCESS-NAME,curl,Claude\n)
      /$1- PROCESS-NAME,curl,Claude\n/sx
-  ' "$tmp"
+  ' "$file"
 
-  # Keep Claude selector locked to the static residential endpoint.
+  # Keep fail-closed option available in Claude selector.
   perl -0777 -i -pe '
     s/(name:\s*Claude\s*\n\s*type:\s*select\s*\n\s*proxies:\s*\n\s*-\s*Claude-Residential\s*\n)
-      \s*-\s*REJECT\s*\n
-     /$1/sx
-  ' "$tmp"
+      (?!\s*-\s*REJECT\s*\n)
+     /$1  - REJECT\n/sx
+  ' "$file"
 
   # Ensure the residential endpoint bypasses TUN routing recursion.
   perl -i -pe '
     s/^(\s*)route-exclude-address:\s*\[\]\s*$/$1route-exclude-address:\n$1  - '"$TARGET_IP"'\/32/mg
-  ' "$tmp"
+  ' "$file"
 
   # Repair malformed joins like ".../32tcp-concurrent: true" or ".../32global-client-fingerprint: ...".
   perl -i -pe '
     s#([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/32)([A-Za-z][A-Za-z0-9-]*:)#$1\n$2#g
-  ' "$tmp"
+  ' "$file"
 
   # Repair wrong indentation under route-exclude-address.
   perl -0777 -i -pe '
     s/^(\s*)route-exclude-address:\s*\n\1-\s*/$1route-exclude-address:\n$1  - /mg
-  ' "$tmp"
-
-  if ! cmp -s "$file" "$tmp"; then
-    cp "$file" "$file.bak-$TS"
-    mv "$tmp" "$file"
-    log "hardened: $file"
-    HEAL_CHANGED=$((HEAL_CHANGED + 1))
-  else
-    rm -f "$tmp"
-    log "already-hardened: $file"
-  fi
-}
-
-archive_old_baks() {
-  local src keep=20 archive="${BAK_ARCHIVE:-$HOME/Archive/2026/clash-verge-bak-20260610}"
-  local baks
-  /bin/mkdir -p "$archive"
-  for src in "$BASE"/*.yaml "$BASE"/profiles/*.yaml; do
-    [[ -f "$src" ]] || continue
-    baks="$(ls -t "$src".bak-* 2>/dev/null || true)"
-    [[ -n "$baks" ]] || continue
-    printf '%s\n' "$baks" | tail -n +$((keep + 1)) | while IFS= read -r f; do
-      [[ -n "$f" ]] || continue
-      mv "$f" "$archive/" 2>/dev/null || true
-    done
-  done
-}
-
-runtime_claude_needs_reload() {
-  local group rules
-  [[ -S "$SOCK" ]] || return 1
-
-  group="$(api_get_proxy_group "Claude" 2>/dev/null || true)"
-  [[ "$group" == *"Claude-Residential"* ]] || return 0
-
-  rules="$(curl --unix-socket "$SOCK" -s http://localhost/rules 2>/dev/null || true)"
-  [[ "$rules" == *"anthropic.com"* ]] || return 0
-  [[ "$rules" == *"claude.ai"* ]] || return 0
-  [[ "$rules" == *"claude.com"* ]] || return 0
-  [[ "$rules" == *"clau.de"* ]] || return 0
-  [[ "$rules" == *"claudeusercontent.com"* ]] || return 0
-  [[ "$rules" == *"api.ipify.org"* ]] || return 0
-  [[ "$rules" == *"ipv4.icanhazip.com"* ]] || return 0
-  [[ "$rules" == *"ip.sb"* ]] || return 0
-  [[ "$rules" == *"claude.exe"* ]] || return 0
-  return 1
-}
-
-write_expanded_runtime_config() {
-  local src="$BASE/clash-verge.yaml"
-  local dst="$BASE/clash-verge-guard-expanded.yaml"
-  [[ -f "$src" ]] || return 1
-
-  /usr/bin/python3 - "$src" "$dst" "$TARGET_IP" <<'PY'
-import sys
-import yaml
-
-src, dst, target_ip = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(src) as f:
-    data = yaml.safe_load(f)
-
-prepend_proxies = data.pop("prepend-proxies", []) or []
-prepend_groups = data.pop("prepend-proxy-groups", []) or []
-prepend_rules = data.pop("prepend-rules", []) or []
-data.pop("append-proxies", None)
-data.pop("append-proxy-groups", None)
-data.pop("append-rules", None)
-
-proxies = data.get("proxies") or []
-groups = data.get("proxy-groups") or []
-rules = data.get("rules") or []
-
-proxy_names = {p.get("name") for p in proxies if isinstance(p, dict)}
-group_names = {g.get("name") for g in groups if isinstance(g, dict)}
-
-data["proxies"] = [p for p in prepend_proxies if isinstance(p, dict) and p.get("name") not in proxy_names] + proxies
-merged_groups = [g for g in prepend_groups if isinstance(g, dict) and g.get("name") not in group_names] + groups
-merged_rules = [r for r in prepend_rules if r not in rules] + rules
-
-claude_rules = [
-    f"IP-CIDR,{target_ip}/32,DIRECT,no-resolve",
-    "DOMAIN,ifconfig.me,Claude",
-    "DOMAIN,api.ipify.org,Claude",
-    "DOMAIN,ipv4.icanhazip.com,Claude",
-    "DOMAIN-SUFFIX,ip.sb,Claude",
-    "DOMAIN-SUFFIX,ping0.cc,Claude",
-    "PROCESS-NAME,curl,Claude",
-    "PROCESS-NAME,claude.exe,Claude",
-    "PROCESS-NAME,claude,Claude",
-    "DOMAIN-SUFFIX,anthropic.com,Claude",
-    "DOMAIN-SUFFIX,claude.ai,Claude",
-    "DOMAIN-SUFFIX,claude.com,Claude",
-    "DOMAIN-SUFFIX,clau.de,Claude",
-    "DOMAIN-SUFFIX,claudeusercontent.com,Claude",
-    "DOMAIN-SUFFIX,modelcontextprotocol.io,Claude",
-    "DOMAIN,anthropic.statuspage.io,Claude",
-    "IP-CIDR,160.79.104.0/21,Claude,no-resolve",
-    "IP-CIDR6,2607:6bc0::/48,Claude,no-resolve",
-]
-
-def is_claude_rule(rule):
-    text = str(rule)
-    return any(term in text for term in [
-        target_ip,
-        "Claude-Fast",
-        "anthropic.com",
-        "claude.ai",
-        "claude.com",
-        "clau.de",
-        "claudeusercontent.com",
-        "modelcontextprotocol.io",
-        "anthropic.statuspage.io",
-        "api.ipify.org",
-        "ipv4.icanhazip.com",
-        "ifconfig.me",
-        "ping0.cc",
-        "ip.sb",
-        "PROCESS-NAME,claude.exe",
-        "PROCESS-NAME,claude",
-    ])
-
-clean_groups = []
-inserted_claude = False
-for group in merged_groups:
-    if isinstance(group, dict) and group.get("name") in {"Claude", "Claude-Fast"}:
-        if not inserted_claude:
-            clean_groups.append({"name": "Claude", "type": "select", "proxies": ["Claude-Residential"]})
-            inserted_claude = True
-        continue
-    clean_groups.append(group)
-if not inserted_claude:
-    clean_groups.insert(0, {"name": "Claude", "type": "select", "proxies": ["Claude-Residential"]})
-
-data["proxy-groups"] = clean_groups
-data["rules"] = claude_rules + [r for r in merged_rules if not is_claude_rule(r)]
-
-for group in data["proxy-groups"]:
-    if isinstance(group, dict) and group.get("name") == "Codex-Stable":
-        group["interval"] = 300
-        group["lazy"] = True
-        group["max-failed-times"] = 3
-
-with open(dst, "w") as f:
-    yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-PY
-
-  printf '%s' "$dst"
+  ' "$file"
 }
 
 reload_core() {
@@ -850,19 +605,10 @@ reload_core() {
     return 0
   fi
 
-  # Do a full reload only when source files changed or runtime lost the Claude
-  # guard invariants. Use an expanded config because mihomo does not understand
-  # Clash Verge's prepend-* merge keys directly.
-  if [[ "${HEAL_CHANGED:-0}" -gt 0 ]] || runtime_claude_needs_reload; then
-    local core_cfg
-    core_cfg="$(write_expanded_runtime_config || true)"
-    if [[ -n "$core_cfg" && -f "$core_cfg" ]]; then
-      curl --unix-socket "$SOCK" -s -X PUT -H 'Content-Type: application/json' \
-        -d "{\"path\":\"$core_cfg\",\"force\":true}" http://localhost/configs >/dev/null || true
-      log "core reloaded (HEAL_CHANGED=$HEAL_CHANGED, expanded-runtime)"
-    fi
-  else
-    log "core reload skipped (no on-disk change this run)"
+  local core_cfg="$BASE/clash-verge.yaml"
+  if [[ -f "$core_cfg" ]]; then
+    curl --unix-socket "$SOCK" -s -X PUT -H 'Content-Type: application/json' \
+      -d "{\"path\":\"$core_cfg\",\"force\":true}" http://localhost/configs >/dev/null || true
   fi
 
   # Enforce rule mode every run so global-mode regressions do not reappear.
@@ -874,46 +620,41 @@ reload_core() {
     -d '{"tun":{"enable":true}}' http://localhost/configs >/dev/null || true
 
   # Never route the residential SOCKS endpoint back into TUN/proxy chain.
-  # Also exclude Tailscale's CGNAT (100.64.0.0/10) and IPv6 ULA (fd7a:115c:a1e0::/48)
-  # so the Tailscale virtual network bypasses mihomo's TUN entirely. This lets
-  # the user's Tailscale-based monitoring apps keep working without conflicting
-  # with the gvisor stack, and reduces mihomo's connection-tracker pressure.
   curl --unix-socket "$SOCK" -s -X PATCH -H 'Content-Type: application/json' \
-    -d "{\"tun\":{\"enable\":true,\"route-exclude-address\":[\"$TARGET_IP/32\",\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\"]}}" http://localhost/configs >/dev/null || true
+    -d "{\"tun\":{\"enable\":true,\"route-exclude-address\":[\"$TARGET_IP/32\"]}}" http://localhost/configs >/dev/null || true
 
   # Ensure Claude group points to Claude-Residential
   set_proxy_group_choice "Claude" "Claude-Residential" || true
+
+  # Main egress preference: mitce first (主代理), doggo as auxiliary.
+  set_proxy_group_choice "主代理" "自动选择" || true
+  set_proxy_group_choice "狗狗加速.com" "♻️自动选择" || true
+
+  # Fallback when mitce group is absent in the currently loaded profile.
+  if ! set_proxy_group_choice "GLOBAL" "主代理"; then
+    set_proxy_group_choice "GLOBAL" "狗狗加速.com" || true
+  fi
 }
 
 patch_profiles_state() {
   local file="$BASE/profiles.yaml"
   [[ -f "$file" ]] || return 0
 
-  local tmp
-  tmp="$(mktemp)"
-  cp "$file" "$tmp"
+  cp "$file" "$file.bak-$TS"
 
   perl -0777 -i -pe '
     s/(- name:\s*主代理\s*\n\s*now:\s*).*/${1}自动选择/g;
     s/(- name:\s*OpenAI\s*\n\s*now:\s*).*/${1}SG自动选择/g;
     s/(- name:\s*狗狗加速\.com\s*\n\s*now:\s*).*/${1}♻️自动选择/g;
     s/(- name:\s*GLOBAL\s*\n\s*now:\s*).*/${1}狗狗加速.com/g;
-  ' "$tmp"
+  ' "$file"
 
-  if ! cmp -s "$file" "$tmp"; then
-    cp "$file" "$file.bak-$TS"
-    mv "$tmp" "$file"
-    log "state-updated: $file (verge ui-state only, no core reload needed)"
-  else
-    rm -f "$tmp"
-    log "state-no-change: $file"
-  fi
+  log "state-updated: $file"
 }
 
 check_ip() {
   local ip1 ip2
   local proxy_line user pass server port
-  local proxy_auth
 
   local pattern='Claude-Residential.*server: [^,}]+.*port: [0-9]+.*username: [^,}]+.*password: [^,}]+'
   local search_out
@@ -929,23 +670,26 @@ check_ip() {
     pass="$(printf '%s' "$proxy_line" | sed -E "s/.*password: ([^,}]+).*/\\1/")"
     server="$(printf '%s' "$proxy_line" | sed -E "s/.*server: ([^,}]+).*/\\1/")"
     port="$(printf '%s' "$proxy_line" | sed -E "s/.*port: ([0-9]+).*/\\1/")"
-    proxy_auth="$user:$pass@$server:$port"
 
-    # Validate through the residential SOCKS endpoint itself (HTTPS only).
-    ip1="$(probe_ip_via_socks "$proxy_auth" "https://api.ipify.org" "https://ipv4.icanhazip.com" "https://ip.sb" || true)"
-    ip2="$(probe_ip_via_socks "$proxy_auth" "https://ip.sb" "https://api.ipify.org" "https://ipv4.icanhazip.com" || true)"
+    # Validate through the residential SOCKS endpoint itself.
+    ip1="$(curl -4 -s --max-time 12 --socks5-hostname "$user:$pass@$server:$port" ifconfig.me | tr -d '\r\n' || true)"
+    [[ -z "$ip1" ]] && ip1="$(curl -4 -s --max-time 12 --socks5-hostname "$user:$pass@$server:$port" ip.sb | tr -d '\r\n' || true)"
+    [[ -z "$ip1" ]] && ip1="$(curl -4 -s --max-time 12 --socks5-hostname "$user:$pass@$server:$port" ping0.cc/ip | tr -d '\r\n' || true)"
+    ip2="$(curl -4 -s --max-time 12 --socks5-hostname "$user:$pass@$server:$port" ping0.cc/ip | tr -d '\r\n' || true)"
+    [[ -z "$ip2" ]] && ip2="$(curl -4 -s --max-time 12 --socks5-hostname "$user:$pass@$server:$port" ip.sb | tr -d '\r\n' || true)"
+    [[ -z "$ip2" ]] && ip2="$ip1"
   else
-    # Fallback when credentials are not found in local config files (HTTPS only).
-    ip1="$(probe_ip_direct "https://api.ipify.org" "https://ipv4.icanhazip.com" "https://ip.sb" || true)"
-    ip2="$(probe_ip_direct "https://ip.sb" "https://api.ipify.org" "https://ipv4.icanhazip.com" || true)"
+    # Fallback when credentials are not found in local config files.
+    ip1="$(curl -4 -s --max-time 10 ifconfig.me | tr -d '\r\n' || true)"
+    [[ -z "$ip1" ]] && ip1="$(curl -4 -s --max-time 10 ip.sb | tr -d '\r\n' || true)"
+    [[ -z "$ip1" ]] && ip1="$(curl -4 -s --max-time 10 ping0.cc/ip | tr -d '\r\n' || true)"
+    ip2="$(curl -4 -s --max-time 10 ping0.cc/ip | tr -d '\r\n' || true)"
+    [[ -z "$ip2" ]] && ip2="$(curl -4 -s --max-time 10 ip.sb | tr -d '\r\n' || true)"
+    [[ -z "$ip2" ]] && ip2="$ip1"
   fi
 
-  # Treat single-source failure as degraded, not immediate mismatch.
-  [[ -z "$ip1" && -n "$ip2" ]] && ip1="$ip2"
-  [[ -z "$ip2" && -n "$ip1" ]] && ip2="$ip1"
-
-  log "primary-ip-source=$ip1"
-  log "secondary-ip-source=$ip2"
+  log "ifconfig.me=$ip1"
+  log "ping0.cc/ip=$ip2"
 
   if [[ -z "$ip1" || -z "$ip2" ]]; then
     err "IP check failed (empty response)."
@@ -970,20 +714,14 @@ main() {
     exit 11
   fi
 
-  # Tracks whether this run produced any on-disk change. Used by reload_core
-  # to decide if a full mihomo PUT-reload is necessary (it's only necessary
-  # when an on-disk yaml actually changed).
-  HEAL_CHANGED=0
-
   log "target=$TARGET_IP:$TARGET_PORT"
   log "base=$BASE"
 
   ensure_empty_merge_templates_have_claude
 
-  # clash-verge.yaml / clash-verge-check.yaml are Verge-generated artifacts.
-  # Mutating them here can fight Verge regeneration and force repeated core
-  # reloads. Only mutate source profile files; runtime repair happens below.
   local files=()
+  [[ -f "$BASE/clash-verge.yaml" ]] && files+=("$BASE/clash-verge.yaml")
+  [[ -f "$BASE/clash-verge-check.yaml" ]] && files+=("$BASE/clash-verge-check.yaml")
   if [[ -d "$BASE/profiles" ]]; then
     while IFS= read -r f; do files+=("$f"); done < <(list_yaml_files "$BASE/profiles")
   fi
@@ -1001,7 +739,6 @@ main() {
   done
 
   patch_profiles_state
-  archive_old_baks
   reload_core
   sleep 1
   check_ip
