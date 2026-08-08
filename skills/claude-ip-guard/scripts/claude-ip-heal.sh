@@ -101,6 +101,157 @@ list_yaml_files() {
   fi
 }
 
+resolve_active_merge_source() {
+  local profiles_file="$BASE/profiles.yaml"
+  [[ -f "$profiles_file" ]] || return 1
+  /usr/bin/python3 - "$profiles_file" "$BASE/profiles" <<'PY' 2>/dev/null
+import os
+import sys
+import yaml
+
+profiles_file, profiles_dir = sys.argv[1:3]
+with open(profiles_file) as f:
+    data = yaml.safe_load(f) or {}
+items = [item for item in data.get("items", []) if isinstance(item, dict)]
+by_uid = {item.get("uid"): item for item in items}
+current = by_uid.get(data.get("current")) or {}
+merge_uid = (current.get("option") or {}).get("merge")
+merge = by_uid.get(merge_uid) or {}
+path = os.path.join(profiles_dir, str(merge.get("file") or ""))
+if merge.get("type") == "merge" and os.path.isfile(path):
+    print(path)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+validate_full_chain_topology() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  /usr/bin/python3 - "$file" <<'PY' 2>/dev/null
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+proxies = (data.get("prepend-proxies") or []) + (data.get("proxies") or [])
+groups = (data.get("prepend-proxy-groups") or []) + (data.get("proxy-groups") or [])
+proxy_by_name = {p.get("name"): p for p in proxies if isinstance(p, dict)}
+group_by_name = {g.get("name"): g for g in groups if isinstance(g, dict)}
+
+expected = {
+    "Claude-Residential-JP3": "JP3-HY2",
+    "Claude-Residential-JP1": "JP1-HY2",
+}
+for name, dialer in expected.items():
+    proxy = proxy_by_name.get(name) or {}
+    if proxy.get("type") != "socks5" or proxy.get("dialer-proxy") != dialer:
+        raise SystemExit(1)
+    if not all(proxy.get(k) is not None for k in ("server", "port", "username", "password")):
+        raise SystemExit(1)
+
+residential = group_by_name.get("Claude-Residential") or {}
+claude = group_by_name.get("Claude") or {}
+ok = (
+    residential.get("type") == "fallback"
+    and residential.get("proxies") == list(expected)
+    and residential.get("url") == "https://api.anthropic.com/"
+    and residential.get("interval") == 15
+    and residential.get("lazy") is False
+    and residential.get("max-failed-times") == 2
+    and residential.get("expected-status") == 404
+    and claude.get("type") == "select"
+    and claude.get("proxies") == ["Claude-Residential", "REJECT"]
+    and "Claude-Tunnel" not in group_by_name
+)
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+repair_full_chain_topology() {
+  local file="$1" tmp mode
+  [[ -f "$file" ]] || return 1
+  mode="$(/usr/bin/stat -f %Lp "$file" 2>/dev/null || printf 600)"
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+
+  if ! /usr/bin/python3 - "$file" "$tmp" "$TARGET_IP" "$TARGET_PORT" <<'PY'
+import sys
+import yaml
+
+src, dst, target_ip, target_port = sys.argv[1:5]
+with open(src) as f:
+    data = yaml.safe_load(f) or {}
+
+proxy_key = "prepend-proxies" if "prepend-proxies" in data else "proxies"
+group_key = "prepend-proxy-groups" if "prepend-proxy-groups" in data else "proxy-groups"
+proxies = [p for p in (data.get(proxy_key) or []) if isinstance(p, dict)]
+groups = [g for g in (data.get(group_key) or []) if isinstance(g, dict)]
+
+credential_source = next(
+    (p for p in proxies if str(p.get("name", "")).startswith("Claude-Residential")),
+    None,
+)
+if credential_source is None:
+    raise SystemExit("Claude residential credentials not found")
+
+credentials = {
+    "type": "socks5",
+    "server": target_ip,
+    "port": int(target_port),
+    "username": credential_source.get("username"),
+    "password": credential_source.get("password"),
+    "udp": True,
+}
+if not credentials["username"] or not credentials["password"]:
+    raise SystemExit("Claude residential credentials incomplete")
+
+managed_proxies = [
+    {"name": "Claude-Residential-JP3", **credentials, "dialer-proxy": "JP3-HY2"},
+    {"name": "Claude-Residential-JP1", **credentials, "dialer-proxy": "JP1-HY2"},
+]
+proxies = [p for p in proxies if not str(p.get("name", "")).startswith("Claude-Residential")]
+data[proxy_key] = managed_proxies + proxies
+
+managed_groups = [
+    {
+        "name": "Claude-Residential",
+        "type": "fallback",
+        "proxies": ["Claude-Residential-JP3", "Claude-Residential-JP1"],
+        "url": "https://api.anthropic.com/",
+        "interval": 15,
+        "lazy": False,
+        "max-failed-times": 2,
+        "expected-status": 404,
+    },
+    {
+        "name": "Claude",
+        "type": "select",
+        "proxies": ["Claude-Residential", "REJECT"],
+    },
+]
+managed_names = {"Claude", "Claude-Residential", "Claude-Tunnel"}
+groups = [g for g in groups if g.get("name") not in managed_names]
+data[group_key] = managed_groups + groups
+
+with open(dst, "w") as f:
+    yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+PY
+  then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  /bin/chmod "$mode" "$tmp"
+  if cmp -s "$file" "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  cp -p "$file" "$file.bak-$TS"
+  mv "$tmp" "$file"
+  HEAL_CHANGED=$((HEAL_CHANGED + 1))
+  log "full-chain-topology-repaired: $file"
+}
+
 api_get_proxy_group() {
   local group="$1"
   [[ -S "$SOCK" ]] || return 1
@@ -475,6 +626,9 @@ ensure_full_config_has_doggo_fallback() {
 
 patch_file() {
   local file="$1"
+  repair_full_chain_topology "$file"
+  return $?
+
   [[ -f "$file" ]] || return 0
   if ! file_contains "Claude-Residential" "$file"; then
     return 0
@@ -548,6 +702,9 @@ patch_file() {
 
 harden_file() {
   local file="$1"
+  repair_full_chain_topology "$file"
+  return $?
+
   [[ -f "$file" ]] || return 0
   local tmp
   tmp="$(mktemp)"
@@ -724,11 +881,26 @@ archive_old_baks() {
 }
 
 runtime_claude_needs_reload() {
-  local group rules
+  local claude_group residential_group topology_ok rules
   [[ -S "$SOCK" ]] || return 1
 
-  group="$(api_get_proxy_group "Claude" 2>/dev/null || true)"
-  [[ "$group" == *"Claude-Residential"* ]] || return 0
+  claude_group="$(api_get_proxy_group "Claude" 2>/dev/null || true)"
+  residential_group="$(api_get_proxy_group "Claude-Residential" 2>/dev/null || true)"
+  topology_ok="$(printf '%s\n%s' "$claude_group" "$residential_group" | /usr/bin/python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines()
+try:
+    claude, residential = map(json.loads, lines[:2])
+except Exception:
+    raise SystemExit(1)
+ok = (
+    claude.get("all") == ["Claude-Residential", "REJECT"]
+    and residential.get("all") == ["Claude-Residential-JP3", "Claude-Residential-JP1"]
+    and residential.get("now") in residential.get("all", [])
+)
+raise SystemExit(0 if ok else 1)
+' 2>/dev/null && printf OK || true)"
+  [[ "$topology_ok" == OK ]] || return 0
 
   rules="$(curl --unix-socket "$SOCK" -s http://localhost/rules 2>/dev/null || true)"
   [[ "$rules" == *"anthropic.com"* ]] || return 0
@@ -743,22 +915,60 @@ runtime_claude_needs_reload() {
   return 1
 }
 
+claude_active_connection_count() {
+  local out
+  [[ -S "$SOCK" ]] || return 1
+  out="$(curl --unix-socket "$SOCK" -s http://localhost/connections 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out" | /usr/bin/python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+count = 0
+for conn in data.get("connections", []):
+    meta = conn.get("metadata") or {}
+    host = str(meta.get("host") or "").lower()
+    process = str(meta.get("process") or meta.get("processPath") or "").lower()
+    if any(term in host for term in ("anthropic", "claude.ai", "claude.com")) or "claude" in process:
+        count += 1
+print(count)
+' 2>/dev/null
+}
+
+maintenance_gate_clear() {
+  local elapsed=0 count gate_seconds="${CLAUDE_MAINTENANCE_GATE_SECONDS:-30}"
+  while :; do
+    count="$(claude_active_connection_count 2>/dev/null || printf unavailable)"
+    [[ "$count" == 0 ]] || return 1
+    ((elapsed >= gate_seconds)) && return 0
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+}
+
 write_expanded_runtime_config() {
   local src="$BASE/clash-verge.yaml"
   local dst="$BASE/clash-verge-guard-expanded.yaml"
+  local active_merge
   [[ -f "$src" ]] || return 1
+  active_merge="$(resolve_active_merge_source || true)"
+  [[ -n "$active_merge" && -f "$active_merge" ]] || return 1
 
-  /usr/bin/python3 - "$src" "$dst" "$TARGET_IP" <<'PY'
+  /usr/bin/python3 - "$src" "$dst" "$TARGET_IP" "$active_merge" <<'PY'
 import sys
 import yaml
 
-src, dst, target_ip = sys.argv[1], sys.argv[2], sys.argv[3]
+src, dst, target_ip, active_merge = sys.argv[1:5]
 with open(src) as f:
     data = yaml.safe_load(f)
+with open(active_merge) as f:
+    merge_data = yaml.safe_load(f) or {}
 
-prepend_proxies = data.pop("prepend-proxies", []) or []
-prepend_groups = data.pop("prepend-proxy-groups", []) or []
-prepend_rules = data.pop("prepend-rules", []) or []
+prepend_proxies = merge_data.get("prepend-proxies") or data.pop("prepend-proxies", []) or []
+prepend_groups = merge_data.get("prepend-proxy-groups") or data.pop("prepend-proxy-groups", []) or []
+prepend_rules = merge_data.get("prepend-rules") or data.pop("prepend-rules", []) or []
+data.pop("prepend-proxies", None)
+data.pop("prepend-proxy-groups", None)
+data.pop("prepend-rules", None)
 data.pop("append-proxies", None)
 data.pop("append-proxy-groups", None)
 data.pop("append-rules", None)
@@ -767,11 +977,20 @@ proxies = data.get("proxies") or []
 groups = data.get("proxy-groups") or []
 rules = data.get("rules") or []
 
-proxy_names = {p.get("name") for p in proxies if isinstance(p, dict)}
-group_names = {g.get("name") for g in groups if isinstance(g, dict)}
+all_proxies = [p for p in prepend_proxies + proxies if isinstance(p, dict)]
+qualified_names = ["Claude-Residential-JP3", "Claude-Residential-JP1"]
+qualified_proxies = []
+for name in qualified_names:
+    match = next((p for p in all_proxies if p.get("name") == name), None)
+    if match is None:
+        raise SystemExit(f"missing full-chain proxy: {name}")
+    qualified_proxies.append(match)
+data["proxies"] = qualified_proxies + [
+    p for p in proxies
+    if not str(p.get("name", "")).startswith("Claude-Residential")
+]
 
-data["proxies"] = [p for p in prepend_proxies if isinstance(p, dict) and p.get("name") not in proxy_names] + proxies
-merged_groups = [g for g in prepend_groups if isinstance(g, dict) and g.get("name") not in group_names] + groups
+merged_groups = [g for g in groups + prepend_groups if isinstance(g, dict)]
 merged_rules = [r for r in prepend_rules if r not in rules] + rules
 
 claude_rules = [
@@ -816,17 +1035,29 @@ def is_claude_rule(rule):
         "PROCESS-NAME,claude",
     ])
 
-clean_groups = []
-inserted_claude = False
+managed_group_names = {"Claude", "Claude-Fast", "Claude-Tunnel", "Claude-Residential"}
+other_groups = []
+seen_group_names = set()
 for group in merged_groups:
-    if isinstance(group, dict) and group.get("name") in {"Claude", "Claude-Fast"}:
-        if not inserted_claude:
-            clean_groups.append({"name": "Claude", "type": "select", "proxies": ["Claude-Residential"]})
-            inserted_claude = True
+    name = group.get("name")
+    if name in managed_group_names or name in seen_group_names:
         continue
-    clean_groups.append(group)
-if not inserted_claude:
-    clean_groups.insert(0, {"name": "Claude", "type": "select", "proxies": ["Claude-Residential"]})
+    seen_group_names.add(name)
+    other_groups.append(group)
+
+clean_groups = [
+    {
+        "name": "Claude-Residential",
+        "type": "fallback",
+        "proxies": qualified_names,
+        "url": "https://api.anthropic.com/",
+        "interval": 15,
+        "lazy": False,
+        "max-failed-times": 2,
+        "expected-status": 404,
+    },
+    {"name": "Claude", "type": "select", "proxies": ["Claude-Residential", "REJECT"]},
+] + other_groups
 
 data["proxy-groups"] = clean_groups
 data["rules"] = claude_rules + [r for r in merged_rules if not is_claude_rule(r)]
@@ -844,10 +1075,28 @@ PY
   printf '%s' "$dst"
 }
 
+runtime_core_settings_ok() {
+  local out
+  out="$(curl --unix-socket "$SOCK" -s http://localhost/configs 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out" | /usr/bin/python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+tun = data.get("tun") or {}
+ok = data.get("mode") == "rule" and data.get("ipv6") is False and tun.get("enable") is True
+raise SystemExit(0 if ok else 1)
+' 2>/dev/null
+}
+
 reload_core() {
   if [[ ! -S "$SOCK" ]]; then
     warn "clash socket not found at $SOCK; skip runtime reload"
     return 0
+  fi
+
+  if [[ "${CLAUDE_MAINTENANCE_APPROVED:-}" != 1 ]] && ! maintenance_gate_clear; then
+    err "Claude requests are active; refuse runtime switch/reload"
+    return 20
   fi
 
   # Do a full reload only when source files changed or runtime lost the Claude
@@ -856,22 +1105,27 @@ reload_core() {
   if [[ "${HEAL_CHANGED:-0}" -gt 0 ]] || runtime_claude_needs_reload; then
     local core_cfg
     core_cfg="$(write_expanded_runtime_config || true)"
-    if [[ -n "$core_cfg" && -f "$core_cfg" ]]; then
-      curl --unix-socket "$SOCK" -s -X PUT -H 'Content-Type: application/json' \
-        -d "{\"path\":\"$core_cfg\",\"force\":true}" http://localhost/configs >/dev/null || true
-      log "core reloaded (HEAL_CHANGED=$HEAL_CHANGED, expanded-runtime)"
-    fi
+    [[ -n "$core_cfg" && -f "$core_cfg" ]] || {
+      err "cannot generate expanded runtime config"
+      return 21
+    }
+    curl --unix-socket "$SOCK" -s -X PUT -H 'Content-Type: application/json' \
+      -d "{\"path\":\"$core_cfg\",\"force\":true}" http://localhost/configs >/dev/null || {
+      err "core reload request failed"
+      return 22
+    }
+    log "core reloaded (HEAL_CHANGED=$HEAL_CHANGED, expanded-runtime)"
   else
     log "core reload skipped (no on-disk change this run)"
   fi
 
   # Enforce rule mode every run so global-mode regressions do not reappear.
   curl --unix-socket "$SOCK" -s -X PATCH -H 'Content-Type: application/json' \
-    -d '{"mode":"rule"}' http://localhost/configs >/dev/null || true
+    -d '{"mode":"rule","ipv6":false}' http://localhost/configs >/dev/null || return 23
 
   # Ensure TUN stays enabled, otherwise terminal traffic bypasses Clash entirely.
   curl --unix-socket "$SOCK" -s -X PATCH -H 'Content-Type: application/json' \
-    -d '{"tun":{"enable":true}}' http://localhost/configs >/dev/null || true
+    -d '{"tun":{"enable":true}}' http://localhost/configs >/dev/null || return 23
 
   # Never route the residential SOCKS endpoint back into TUN/proxy chain.
   # Also exclude Tailscale's CGNAT (100.64.0.0/10) and IPv6 ULA (fd7a:115c:a1e0::/48)
@@ -879,10 +1133,15 @@ reload_core() {
   # the user's Tailscale-based monitoring apps keep working without conflicting
   # with the gvisor stack, and reduces mihomo's connection-tracker pressure.
   curl --unix-socket "$SOCK" -s -X PATCH -H 'Content-Type: application/json' \
-    -d "{\"tun\":{\"enable\":true,\"route-exclude-address\":[\"$TARGET_IP/32\",\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\"]}}" http://localhost/configs >/dev/null || true
+    -d "{\"tun\":{\"enable\":true,\"route-exclude-address\":[\"$TARGET_IP/32\",\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\"]}}" http://localhost/configs >/dev/null || return 23
 
   # Ensure Claude group points to Claude-Residential
-  set_proxy_group_choice "Claude" "Claude-Residential" || true
+  set_proxy_group_choice "Claude" "Claude-Residential" || return 24
+  runtime_core_settings_ok || return 25
+  if runtime_claude_needs_reload; then
+    err "runtime topology verification failed after repair"
+    return 26
+  fi
 }
 
 patch_profiles_state() {
@@ -911,6 +1170,25 @@ patch_profiles_state() {
 }
 
 check_ip() {
+  local status ip1 ip2
+  status="$(curl -4 -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15 \
+    https://api.anthropic.com/ 2>/dev/null)" || {
+    err "full-chain Anthropic probe failed"
+    return 2
+  }
+  [[ "$status" == 404 ]] || {
+    err "full-chain Anthropic probe returned unexpected status"
+    return 3
+  }
+  ip1="$(curl -4 -sS --connect-timeout 6 --max-time 10 https://api.ipify.org 2>/dev/null | tr -d '\r\n' || true)"
+  ip2="$(curl -4 -sS --connect-timeout 6 --max-time 10 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\r\n' || true)"
+  [[ "$ip1" == "$TARGET_IP" && "$ip2" == "$TARGET_IP" ]] || {
+    err "full-path egress verification failed"
+    return 4
+  }
+  log "OK: full-chain Anthropic and egress verified"
+  return 0
+
   local ip1 ip2
   local proxy_line user pass server port
   local proxy_auth
@@ -964,6 +1242,17 @@ check_ip() {
   return 0
 }
 
+check_ip_with_warmup() {
+  local attempt max_attempts="${CLAUDE_POST_RELOAD_PROBE_ATTEMPTS:-7}"
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if check_ip; then
+      return 0
+    fi
+    ((attempt < max_attempts)) && sleep 5
+  done
+  return 1
+}
+
 main() {
   if [[ -z "$TARGET_IP" || -z "$TARGET_PORT" ]]; then
     err "Target IP/port missing. Usage: claude-ip-heal <ip> <port> or set CLAUDE_STATIC_IP/CLAUDE_STATIC_PORT."
@@ -975,36 +1264,30 @@ main() {
   # when an on-disk yaml actually changed).
   HEAL_CHANGED=0
 
-  log "target=$TARGET_IP:$TARGET_PORT"
-  log "base=$BASE"
-
-  ensure_empty_merge_templates_have_claude
-
-  # clash-verge.yaml / clash-verge-check.yaml are Verge-generated artifacts.
-  # Mutating them here can fight Verge regeneration and force repeated core
-  # reloads. Only mutate source profile files; runtime repair happens below.
-  local files=()
-  if [[ -d "$BASE/profiles" ]]; then
-    while IFS= read -r f; do files+=("$f"); done < <(list_yaml_files "$BASE/profiles")
+  if [[ "${CLAUDE_MAINTENANCE_APPROVED:-}" != 1 ]] && ! maintenance_gate_clear; then
+    err "Claude requests are active; refuse source mutation and reload"
+    exit 20
   fi
 
-  if [[ ${#files[@]} -eq 0 ]]; then
-    err "No Clash Verge config files found under $BASE"
+  log "target endpoint configured"
+  log "base=$BASE"
+
+  local active_merge
+  active_merge="$(resolve_active_merge_source || true)"
+  if [[ -z "$active_merge" ]]; then
+    err "Cannot resolve active merge source"
     exit 10
   fi
 
-  for f in "${files[@]}"; do
-    ensure_full_config_has_claude "$f"
-    ensure_full_config_has_doggo_fallback "$f"
-    patch_file "$f"
-    harden_file "$f"
-  done
-
-  patch_profiles_state
-  archive_old_baks
+  repair_full_chain_topology "$active_merge"
+  validate_full_chain_topology "$active_merge" || {
+    err "Full-chain topology validation failed"
+    exit 12
+  }
   reload_core
-  sleep 1
-  check_ip
+  check_ip_with_warmup
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

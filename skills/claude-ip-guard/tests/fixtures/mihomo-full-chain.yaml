@@ -1,0 +1,47 @@
+mixed-port: 17898
+allow-lan: false
+mode: rule
+log-level: silent
+ipv6: false
+
+proxies:
+  - name: JP3-HY2
+    type: direct
+  - name: JP1-HY2
+    type: direct
+  - name: Claude-Residential-JP3
+    type: socks5
+    server: 192.0.2.10
+    port: 443
+    username: fixture-user
+    password: fixture-password
+    udp: true
+    dialer-proxy: JP3-HY2
+  - name: Claude-Residential-JP1
+    type: socks5
+    server: 192.0.2.10
+    port: 443
+    username: fixture-user
+    password: fixture-password
+    udp: true
+    dialer-proxy: JP1-HY2
+
+proxy-groups:
+  - name: Claude-Residential
+    type: fallback
+    proxies:
+      - Claude-Residential-JP3
+      - Claude-Residential-JP1
+    url: https://api.anthropic.com/
+    interval: 15
+    lazy: false
+    max-failed-times: 2
+    expected-status: 404
+  - name: Claude
+    type: select
+    proxies:
+      - Claude-Residential
+      - REJECT
+
+rules:
+  - MATCH,Claude
