@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[3]
+GUARD_DIR = ROOT / "skills" / "claude-ip-guard"
+ENFORCER = GUARD_DIR / "scripts" / "claude-ip-enforce.sh"
+HEAL = GUARD_DIR / "scripts" / "claude-ip-heal.sh"
+MERGE_EXAMPLE = ROOT / "merge-profile-example.yaml"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def run_bash(body: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/bash", "-c", body],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "LC_ALL": "C"},
+        check=False,
+    )
+
+
+class GuardBehaviorTests(unittest.TestCase):
+    def source_enforcer(self, body: str) -> subprocess.CompletedProcess[str]:
+        self.assertTrue(ENFORCER.is_file(), "tracked enforcer source is missing")
+        return run_bash(f'source "{ENFORCER}"\n{body}')
+
+    def test_direct_socks_success_does_not_mask_full_chain_failure(self) -> None:
+        result = self.source_enforcer(
+            """
+runtime_claude_guard_ok() { return 0; }
+anthropic_full_chain_ok() { ANTHROPIC_RESULT=failed; return 1; }
+full_path_ip_status() { FULL_PATH_IP_RESULT=192.0.2.10; return 0; }
+residential_socks_direct_ok() { RESIDENTIAL_DIRECT_RESULT=ok; return 0; }
+if guard_fast_path_ok; then
+  exit 90
+fi
+exit 0
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fallback_accepts_second_qualified_chain_when_first_is_dead(self) -> None:
+        result = self.source_enforcer(
+            """
+api_get_group() {
+  case "$1" in
+    Claude) printf '%s' '{"name":"Claude","type":"Selector","now":"Claude-Residential","all":["Claude-Residential","REJECT"]}' ;;
+    Claude-Residential) printf '%s' '{"name":"Claude-Residential","type":"Fallback","now":"Claude-Residential-JP1","all":["Claude-Residential-JP3","Claude-Residential-JP1"]}' ;;
+  esac
+}
+runtime_core_ok() { return 0; }
+runtime_claude_rules_ok() { return 0; }
+anthropic_full_chain_ok() { ANTHROPIC_RESULT=http-404; return 0; }
+full_path_ip_status() { FULL_PATH_IP_RESULT=192.0.2.10; return 0; }
+TARGET_IP=192.0.2.10
+runtime_claude_guard_ok || exit 91
+[[ "$CURRENT_CHAIN_CANDIDATE" == Claude-Residential-JP1 ]] || exit 92
+guard_fast_path_ok || exit 93
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_clean_healthy_cycle_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            calls = Path(td) / "calls"
+            result = self.source_enforcer(
+                f"""
+CALLS={shlex.quote(str(calls))}
+guard_fast_path_ok() {{ return 0; }}
+current_state() {{ printf OK; }}
+current_fail_count() {{ printf 0; }}
+set_state() {{ echo set-state >> "$CALLS"; }}
+set_fail_count() {{ echo set-fail >> "$CALLS"; }}
+write_guard_state() {{ echo state-json >> "$CALLS"; }}
+append_guard_event() {{ echo event >> "$CALLS"; }}
+run_heal() {{ echo heal >> "$CALLS"; }}
+reload_core() {{ echo reload >> "$CALLS"; }}
+set_group_choice() {{ echo switch >> "$CALLS"; }}
+run_enforcer_cycle
+[[ ! -e "$CALLS" ]]
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ip_mismatch_really_selects_reject(self) -> None:
+        result = self.source_enforcer(
+            """
+choice=Claude-Residential
+set_group_choice() { [[ "$1" == Claude ]] || exit 94; choice="$2"; }
+current_group_choice() { printf '%s' "$choice"; }
+reject_claude_now
+[[ "$choice" == REJECT ]]
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_nonzero_claude_requests_block_maintenance_mutation(self) -> None:
+        result = self.source_enforcer(
+            """
+claude_active_connection_count() { printf 1; }
+MAINTENANCE_GATE_SECONDS=30
+if maintenance_gate_clear; then
+  exit 95
+fi
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TopologyTests(unittest.TestCase):
+    def test_merge_example_contains_only_qualified_full_chains(self) -> None:
+        text = MERGE_EXAMPLE.read_text()
+        self.assertIn("name: 'Claude-Residential-JP3'", text)
+        self.assertIn("dialer-proxy: JP3-HY2", text)
+        self.assertIn("name: 'Claude-Residential-JP1'", text)
+        self.assertIn("dialer-proxy: JP1-HY2", text)
+        self.assertIn("expected-status: 404", text)
+        self.assertIn("- REJECT", text)
+        self.assertNotIn("name: Claude-Tunnel", text)
+
+    def test_heal_preserves_and_validates_full_chain_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            candidate = Path(td) / "merge.yaml"
+            shutil.copyfile(FIXTURES / "full-chain.yaml", candidate)
+            result = run_bash(
+                f"""
+source "{HEAL}"
+TARGET_IP=192.0.2.10
+TARGET_PORT=443
+HEAL_CHANGED=0
+patch_file "{candidate}"
+harden_file "{candidate}"
+validate_full_chain_topology "{candidate}"
+! grep -q 'Claude-Tunnel' "{candidate}"
+grep -q 'dialer-proxy: JP3-HY2' "{candidate}"
+grep -q 'dialer-proxy: JP1-HY2' "{candidate}"
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_heal_rejects_legacy_tunnel_topology(self) -> None:
+        result = run_bash(
+            f"""
+source "{HEAL}"
+if validate_full_chain_topology "{FIXTURES / 'legacy-tunnel.yaml'}"; then
+  exit 96
+fi
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_heal_waits_for_post_reload_warmup_without_reloading_again(self) -> None:
+        result = run_bash(
+            f"""
+source "{HEAL}"
+attempts=0
+reloads=0
+check_ip() {{ attempts=$((attempts + 1)); ((attempts >= 2)); }}
+reload_core() {{ reloads=$((reloads + 1)); }}
+sleep() {{ :; }}
+check_ip_with_warmup
+[[ "$attempts" == 2 ]]
+[[ "$reloads" == 0 ]]
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
