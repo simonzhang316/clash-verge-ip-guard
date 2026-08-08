@@ -22,6 +22,7 @@ Before applying this skill, read:
 - `skills/claude-ip-guard/references/claude-ip-ops-runbook-zh.md`
 
 Treat the "三项必检清单" in that file as mandatory release gates.
+The topology examples in older references are historical; the full-chain fallback in this file and ADR 0003 is canonical.
 
 ## When To Use
 
@@ -44,21 +45,23 @@ Treat the "三项必检清单" in that file as mandatory release gates.
 
 ```yaml
 prepend-proxies:
-  - { name: 'Claude-Residential', type: socks5, server: x.x.x.x, port: 443, username: xxx, password: xxx, udp: true, dialer-proxy: Claude-Tunnel }
+  - { name: 'Claude-Residential-JP3', type: socks5, server: x.x.x.x, port: 443, username: xxx, password: xxx, udp: true, dialer-proxy: JP3-HY2 }
+  - { name: 'Claude-Residential-JP1', type: socks5, server: x.x.x.x, port: 443, username: xxx, password: xxx, udp: true, dialer-proxy: JP1-HY2 }
 
 prepend-proxy-groups:
-  # Claude-Tunnel 成员是当前订阅的节点名(2026-08 mitce),换订阅时同步适配。
-  # fallback 自动容灾;实测第一跳选 SG(HK 出口到美西家宽端口不通,勿换 HK 优先)。
-  - name: Claude-Tunnel
+  # 每个成员都是第一跳 → 静态住宅 SOCKS → Anthropic 的完整链。
+  # 仅放入通过 20/20 连续请求和 4/4 空闲首连资格测试的成员。
+  - name: Claude-Residential
     type: fallback
-    proxies: [SG5-HY2, SG4-HY2, JP2-HY2, JP3-HY2, JP4-HY2, 主代理]
-    url: http://cp.cloudflare.com/generate_204
-    interval: 300
-    lazy: true
-    max-failed-times: 3
+    proxies: [Claude-Residential-JP3, Claude-Residential-JP1]
+    url: https://api.anthropic.com/
+    interval: 15
+    lazy: false
+    max-failed-times: 2
+    expected-status: 404
   - name: Claude
     type: select
-    proxies: [Claude-Residential]
+    proxies: [Claude-Residential, REJECT]
 
 prepend-rules:
   - DOMAIN,ifconfig.me,Claude
@@ -93,7 +96,7 @@ prepend-rules:
 Must pass all 3 checks from the reference file:
 
 1. Subscription auto-update is disabled.
-2. `Claude-Tunnel` contains real and reachable first-hop nodes.
+2. `Claude-Residential` contains only qualified full-chain members, with JP3 first.
 3. Terminal bare `curl` shows expected residential IP.
 
 Run in a clean terminal:
@@ -109,7 +112,7 @@ Optional deep check (Clash unix socket):
 
 ```bash
 curl --unix-socket /tmp/verge/verge-mihomo.sock -s http://localhost/configs | rg '"mode"|"ipv6"'
-curl --unix-socket /tmp/verge/verge-mihomo.sock -s http://localhost/proxies/Claude-Tunnel | rg '"now"'
+curl --unix-socket /tmp/verge/verge-mihomo.sock -s http://localhost/proxies/Claude-Residential | rg '"now"|"all"'
 ```
 
 ## Safe Launch Guard
@@ -157,7 +160,7 @@ end run
 
 ## Operating Rules
 
-- Never switch proxy nodes while Claude is open.
+- Never manually switch the Claude selector while Claude is open; the qualified full-chain fallback may fail over automatically.
 - If network changes (sleep wake, Wi-Fi switch, Clash restart), close Claude, re-check IP, then reopen.
 - Before every Claude launch, pass the verification gate first.
 
@@ -180,9 +183,9 @@ If IP suddenly becomes unexpected:
 
 1. Quit Claude completely.
 2. Ensure Clash mode is `rule`, TUN on, IPv6 off.
-3. Re-select `Claude-Tunnel` to a working SG/AU node.
-4. Re-run the two `curl` checks.
-5. Reopen Claude only after IP matches expected value.
+3. Keep Claude closed while the guard verifies or repairs the full-chain fallback.
+4. Re-run the Anthropic TLS check and the two bare `curl` IP checks.
+5. Reopen Claude only after the full chain and expected IP both pass.
 
 ## Auto Rollback Heal Script
 
@@ -194,11 +197,13 @@ claude-ip-heal <EXPECTED_IP> <EXPECTED_PORT>
 
 What it does:
 
-- Scans Clash Verge config/profile YAML files.
-- Forces `Claude-Residential` endpoint back to your target static IP+port.
-- Removes `dialer-proxy: Claude-Tunnel` under `Claude-Residential` (drift-prone in this setup).
-- Reloads Mihomo via unix socket.
-- Verifies both `ifconfig.me` and `ping0.cc/ip` match expected static IP.
+- Resolves and repairs only the current profile's active merge source.
+- Preserves the two qualified full-chain proxies and their fixed first-hop `dialer-proxy` values.
+- Keeps `Claude` fail-closed capable by retaining `REJECT` as an actual member.
+- Refuses source mutation or core reload while Claude requests are active.
+- After repair, verifies Anthropic through the full chain and two full-path IP sources.
+
+The scheduled enforcer source is tracked beside heal as `scripts/claude-ip-enforce.sh`. Its healthy fast path performs no file write, heal, selector mutation, or core reload.
 
 Script source in this skill:
 
