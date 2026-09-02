@@ -19,7 +19,7 @@ FAIL_THRESHOLD="${CLAUDE_ENFORCE_FAIL_THRESHOLD:-3}"
 ANTHROPIC_URL="${CLAUDE_ANTHROPIC_HEALTH_URL:-https://api.anthropic.com/}"
 ANTHROPIC_EXPECTED_STATUS="${CLAUDE_ANTHROPIC_EXPECTED_STATUS:-404}"
 MAINTENANCE_GATE_SECONDS="${CLAUDE_MAINTENANCE_GATE_SECONDS:-30}"
-FULL_CHAIN_CANDIDATES_CSV="${CLAUDE_FULL_CHAIN_CANDIDATES:-Claude-Residential-JP3,Claude-Residential-JP1}"
+FULL_CHAIN_CANDIDATES_CSV="${CLAUDE_FULL_CHAIN_CANDIDATES:-Claude-Residential-JP3,Claude-Residential-JP1,Claude-Residential-SG5,Claude-Residential-SG4}"
 
 OPEN_ON_OK=false
 SILENT=false
@@ -179,7 +179,7 @@ for path in sys.argv[1:]:
     for proxy in proxies:
         if not isinstance(proxy, dict):
             continue
-        if proxy.get("name") not in {"Claude-Residential-JP3", "Claude-Residential-JP1"}:
+        if proxy.get("name") not in {"Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"}:
             continue
         values = [proxy.get(k) for k in ("username", "password", "server", "port")]
         if all(v is not None and str(v) for v in values):

@@ -142,6 +142,8 @@ group_by_name = {g.get("name"): g for g in groups if isinstance(g, dict)}
 expected = {
     "Claude-Residential-JP3": "JP3-HY2",
     "Claude-Residential-JP1": "JP1-HY2",
+    "Claude-Residential-SG5": "SG5-HY2",
+    "Claude-Residential-SG4": "SG4-HY2",
 }
 for name, dialer in expected.items():
     proxy = proxy_by_name.get(name) or {}
@@ -208,6 +210,8 @@ if not credentials["username"] or not credentials["password"]:
 managed_proxies = [
     {"name": "Claude-Residential-JP3", **credentials, "dialer-proxy": "JP3-HY2"},
     {"name": "Claude-Residential-JP1", **credentials, "dialer-proxy": "JP1-HY2"},
+    {"name": "Claude-Residential-SG5", **credentials, "dialer-proxy": "SG5-HY2"},
+    {"name": "Claude-Residential-SG4", **credentials, "dialer-proxy": "SG4-HY2"},
 ]
 proxies = [p for p in proxies if not str(p.get("name", "")).startswith("Claude-Residential")]
 data[proxy_key] = managed_proxies + proxies
@@ -216,7 +220,12 @@ managed_groups = [
     {
         "name": "Claude-Residential",
         "type": "fallback",
-        "proxies": ["Claude-Residential-JP3", "Claude-Residential-JP1"],
+        "proxies": [
+            "Claude-Residential-JP3",
+            "Claude-Residential-JP1",
+            "Claude-Residential-SG5",
+            "Claude-Residential-SG4",
+        ],
         "url": "https://api.anthropic.com/",
         "interval": 15,
         "lazy": False,
@@ -895,7 +904,7 @@ except Exception:
     raise SystemExit(1)
 ok = (
     claude.get("all") == ["Claude-Residential", "REJECT"]
-    and residential.get("all") == ["Claude-Residential-JP3", "Claude-Residential-JP1"]
+    and residential.get("all") == ["Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"]
     and residential.get("now") in residential.get("all", [])
 )
 raise SystemExit(0 if ok else 1)
@@ -978,7 +987,7 @@ groups = data.get("proxy-groups") or []
 rules = data.get("rules") or []
 
 all_proxies = [p for p in prepend_proxies + proxies if isinstance(p, dict)]
-qualified_names = ["Claude-Residential-JP3", "Claude-Residential-JP1"]
+qualified_names = ["Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"]
 qualified_proxies = []
 for name in qualified_names:
     match = next((p for p in all_proxies if p.get("name") == name), None)
