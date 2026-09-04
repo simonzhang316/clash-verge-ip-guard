@@ -7,10 +7,10 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/python3</string>
-    <string>/Users/zhangxinran/Projects/clash-verge-ip-guard/ip-monitor/ip_monitor_server.py</string>
+    <string>/Users/zhangxinran/Projects/clash-verge/ip-monitor/ip_monitor_server.py</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/zhangxinran/Projects/clash-verge-ip-guard/ip-monitor</string>
+  <string>/Users/zhangxinran/Projects/clash-verge/ip-monitor</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

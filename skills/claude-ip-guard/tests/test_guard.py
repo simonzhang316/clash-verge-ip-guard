@@ -5,15 +5,20 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[3]
 GUARD_DIR = ROOT / "skills" / "claude-ip-guard"
 ENFORCER = GUARD_DIR / "scripts" / "claude-ip-enforce.sh"
 HEAL = GUARD_DIR / "scripts" / "claude-ip-heal.sh"
+CUTOVER = GUARD_DIR / "scripts" / "cutover.sh"
+ROLLBACK = GUARD_DIR / "scripts" / "rollback.sh"
 MERGE_EXAMPLE = ROOT / "merge-profile-example.yaml"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -54,8 +59,8 @@ exit 0
             """
 api_get_group() {
   case "$1" in
-    Claude) printf '%s' '{"name":"Claude","type":"Selector","now":"Claude-Residential","all":["Claude-Residential","REJECT"]}' ;;
-    Claude-Residential) printf '%s' '{"name":"Claude-Residential","type":"Fallback","now":"Claude-Residential-JP1","all":["Claude-Residential-JP3","Claude-Residential-JP1"]}' ;;
+    Claude) printf '%s' '{"name":"Claude","type":"Selector","now":"Claude-VPS","all":["Claude-VPS","Claude-Residential","REJECT"]}' ;;
+    Claude-Residential) printf '%s' '{"name":"Claude-Residential","type":"Fallback","now":"Claude-Residential-JP1","all":["Claude-Residential-JP3","Claude-Residential-JP1","Claude-Residential-SG5","Claude-Residential-SG4"]}' ;;
   esac
 }
 runtime_core_ok() { return 0; }
@@ -118,6 +123,165 @@ fi
 
 
 class TopologyTests(unittest.TestCase):
+    def test_cutover_scripts_load_vps_endpoint_from_local_params(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            params = Path(td) / "reality_params.txt"
+            params.write_text("server=198.51.100.20\nport=443\n")
+            for script in (CUTOVER, ROLLBACK):
+                with self.subTest(script=script.name):
+                    result = run_bash(
+                        f"""
+source "{script}"
+PARAMS_FILE={shlex.quote(str(params))}
+VPS_IP=
+VPS_PORT=
+load_vps_endpoint
+[[ "$VPS_IP" == 198.51.100.20 ]]
+[[ "$VPS_PORT" == 443 ]]
+"""
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cutover_backup_preserves_executable_wrapper_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            source = temp / "wrapper"
+            backup = temp / "wrapper.backup"
+            source.write_text("#!/bin/bash\nexit 0\n")
+            source.chmod(0o755)
+            result = run_bash(
+                f"""
+source "{CUTOVER}"
+backup_file {shlex.quote(str(source))} {shlex.quote(str(backup))} 700
+[[ -x {shlex.quote(str(backup))} ]]
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cutover_can_reload_the_backed_up_runtime_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            base = temp / "base"
+            base.mkdir()
+            runtime = base / "clash-verge-guard-expanded.yaml"
+            runtime.write_text("mode: rule\n")
+            sock = temp / "mihomo.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(sock))
+            listener.close()
+            capture = temp / "curl.args"
+            fake_curl = temp / "curl"
+            fake_curl.write_text(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n"
+            )
+            fake_curl.chmod(0o755)
+            result = run_bash(
+                f"""
+source "{CUTOVER}"
+BASE={shlex.quote(str(base))}
+SOCK={shlex.quote(str(sock))}
+CURL_BIN={shlex.quote(str(fake_curl))}
+CAPTURE={shlex.quote(str(capture))}
+export CAPTURE
+reload_restored_runtime
+grep -F {shlex.quote(str(runtime))} "$CAPTURE"
+grep -F 'http://localhost/configs' "$CAPTURE"
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cutover_failure_restoration_activates_backed_up_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            base = temp / "base"
+            backup = temp / "backup"
+            base.mkdir()
+            backup.mkdir()
+            active_merge = temp / "active-merge.yaml"
+            plist = temp / "enforcer.plist"
+            wrapper = temp / "claude-ip-heal"
+            marker = temp / "runtime-reloaded"
+            for path in (
+                backup / "clash-verge.yaml",
+                backup / "active-merge.yaml",
+                backup / "clash-verge-guard-expanded.yaml",
+                backup / "com.zhangxinran.claude-ip-enforcer.plist",
+                backup / "claude-ip-heal.wrapper",
+            ):
+                path.write_text("backup\n")
+            result = run_bash(
+                f"""
+source "{CUTOVER}"
+BASE={shlex.quote(str(base))}
+BACKUP_DIR={shlex.quote(str(backup))}
+ACTIVE_MERGE={shlex.quote(str(active_merge))}
+PLIST={shlex.quote(str(plist))}
+WRAPPER={shlex.quote(str(wrapper))}
+LAUNCHCTL_BIN=/usr/bin/false
+HEAL_BIN=/usr/bin/true
+NOTIFY_BIN=/usr/bin/true
+MUTATION_STARTED=1
+ENFORCER_WAS_LOADED=0
+reload_restored_runtime() {{ printf called > {shlex.quote(str(marker))}; }}
+set +e
+(restore_failed_cutover 42)
+rc=$?
+set -e
+[[ "$rc" == 42 ]]
+[[ -f {shlex.quote(str(marker))} ]]
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cutover_injects_vps_into_indentationless_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            params = temp / "reality_params.txt"
+            merge = temp / "merge.yaml"
+            params.write_text(
+                "\n".join(
+                    [
+                        "server=198.51.100.20",
+                        "port=443",
+                        "uuid=00000000-0000-4000-8000-000000000001",
+                        "publicKey=fixture-public-key",
+                        "shortId=fixture-short-id",
+                        "sni=www.example.com",
+                    ]
+                )
+                + "\n"
+            )
+            merge.write_text(
+                """prepend-proxies:
+- { name: 'Claude-Residential-JP3', type: socks5, server: 192.0.2.10, port: 443, username: fixture-user, password: fixture-password, udp: true, dialer-proxy: JP3-HY2 }
+prepend-proxy-groups:
+- name: Claude
+  type: select
+  proxies:
+  - Claude-Residential
+  - REJECT
+"""
+            )
+            result = run_bash(
+                f"""
+source "{CUTOVER}"
+PARAMS_FILE={shlex.quote(str(params))}
+VPS_IP=198.51.100.20
+VPS_PORT=443
+inject_vps_node {shlex.quote(str(merge))}
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = yaml.safe_load(merge.read_text()) or {}
+            proxies = data.get("prepend-proxies") or []
+            groups = data.get("prepend-proxy-groups") or []
+            self.assertTrue(any(proxy.get("name") == "Claude-VPS" for proxy in proxies))
+            claude = next(group for group in groups if group.get("name") == "Claude")
+            self.assertEqual(
+                claude.get("proxies"),
+                ["Claude-VPS", "Claude-Residential", "REJECT"],
+            )
+
     def test_merge_example_contains_only_qualified_full_chains(self) -> None:
         text = MERGE_EXAMPLE.read_text()
         self.assertIn("name: 'Claude-Residential-JP3'", text)
@@ -130,13 +294,18 @@ class TopologyTests(unittest.TestCase):
 
     def test_heal_preserves_and_validates_full_chain_topology(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            candidate = Path(td) / "merge.yaml"
+            base = Path(td)
+            (base / "profiles").mkdir()
+            candidate = base / "profiles" / "merge.yaml"
             shutil.copyfile(FIXTURES / "full-chain.yaml", candidate)
             result = run_bash(
                 f"""
 source "{HEAL}"
-TARGET_IP=192.0.2.10
+BASE={shlex.quote(str(base))}
+TARGET_IP=198.51.100.20
 TARGET_PORT=443
+RESIDENTIAL_IP=192.0.2.10
+RESIDENTIAL_PORT=443
 HEAL_CHANGED=0
 patch_file "{candidate}"
 harden_file "{candidate}"
@@ -147,6 +316,33 @@ grep -q 'dialer-proxy: JP1-HY2' "{candidate}"
 """
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_heal_validates_rollback_target_without_rewriting_vps_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "profiles").mkdir()
+            candidate = base / "profiles" / "merge.yaml"
+            shutil.copyfile(FIXTURES / "full-chain.yaml", candidate)
+            result = run_bash(
+                f"""
+source "{HEAL}"
+BASE={shlex.quote(str(base))}
+TARGET_IP=192.0.2.10
+TARGET_PORT=443
+RESIDENTIAL_IP=192.0.2.10
+RESIDENTIAL_PORT=443
+HEAL_CHANGED=0
+patch_file "{candidate}"
+harden_file "{candidate}"
+validate_full_chain_topology "{candidate}"
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = yaml.safe_load(candidate.read_text()) or {}
+            proxies = data.get("prepend-proxies") or data.get("proxies") or []
+            vps = next(proxy for proxy in proxies if proxy.get("name") == "Claude-VPS")
+            self.assertEqual(vps.get("server"), "198.51.100.20")
+            self.assertEqual(vps.get("port"), 443)
 
     def test_heal_rejects_legacy_tunnel_topology(self) -> None:
         result = run_bash(
