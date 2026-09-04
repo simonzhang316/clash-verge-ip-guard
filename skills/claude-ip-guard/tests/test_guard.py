@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -153,6 +154,81 @@ load_vps_endpoint
 source "{CUTOVER}"
 backup_file {shlex.quote(str(source))} {shlex.quote(str(backup))} 700
 [[ -x {shlex.quote(str(backup))} ]]
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cutover_can_reload_the_backed_up_runtime_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            base = temp / "base"
+            base.mkdir()
+            runtime = base / "clash-verge-guard-expanded.yaml"
+            runtime.write_text("mode: rule\n")
+            sock = temp / "mihomo.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(sock))
+            listener.close()
+            capture = temp / "curl.args"
+            fake_curl = temp / "curl"
+            fake_curl.write_text(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n"
+            )
+            fake_curl.chmod(0o755)
+            result = run_bash(
+                f"""
+source "{CUTOVER}"
+BASE={shlex.quote(str(base))}
+SOCK={shlex.quote(str(sock))}
+CURL_BIN={shlex.quote(str(fake_curl))}
+CAPTURE={shlex.quote(str(capture))}
+export CAPTURE
+reload_restored_runtime
+grep -F {shlex.quote(str(runtime))} "$CAPTURE"
+grep -F 'http://localhost/configs' "$CAPTURE"
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cutover_failure_restoration_activates_backed_up_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            base = temp / "base"
+            backup = temp / "backup"
+            base.mkdir()
+            backup.mkdir()
+            active_merge = temp / "active-merge.yaml"
+            plist = temp / "enforcer.plist"
+            wrapper = temp / "claude-ip-heal"
+            marker = temp / "runtime-reloaded"
+            for path in (
+                backup / "clash-verge.yaml",
+                backup / "active-merge.yaml",
+                backup / "clash-verge-guard-expanded.yaml",
+                backup / "com.zhangxinran.claude-ip-enforcer.plist",
+                backup / "claude-ip-heal.wrapper",
+            ):
+                path.write_text("backup\n")
+            result = run_bash(
+                f"""
+source "{CUTOVER}"
+BASE={shlex.quote(str(base))}
+BACKUP_DIR={shlex.quote(str(backup))}
+ACTIVE_MERGE={shlex.quote(str(active_merge))}
+PLIST={shlex.quote(str(plist))}
+WRAPPER={shlex.quote(str(wrapper))}
+LAUNCHCTL_BIN=/usr/bin/false
+HEAL_BIN=/usr/bin/true
+NOTIFY_BIN=/usr/bin/true
+MUTATION_STARTED=1
+ENFORCER_WAS_LOADED=0
+reload_restored_runtime() {{ printf called > {shlex.quote(str(marker))}; }}
+set +e
+(restore_failed_cutover 42)
+rc=$?
+set -e
+[[ "$rc" == 42 ]]
+[[ -f {shlex.quote(str(marker))} ]]
 """
             )
             self.assertEqual(result.returncode, 0, result.stderr)

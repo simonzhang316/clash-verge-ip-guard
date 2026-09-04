@@ -5,6 +5,7 @@ VPS_IP="${CLAUDE_VPS_IP:-}"
 VPS_PORT="${CLAUDE_VPS_PORT:-}"
 RESIDENTIAL_IP="${CLAUDE_RESIDENTIAL_IP:-38.45.149.73}"
 RESIDENTIAL_PORT="${CLAUDE_RESIDENTIAL_PORT:-23695}"
+SOCK="${CLASH_SOCK:-/tmp/verge/verge-mihomo.sock}"
 BASE="${CLASH_VERGE_BASE:-/Users/zhangxinran/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 PARAMS_FILE="${CLAUDE_VPS_PARAMS_FILE:-/Users/zhangxinran/Scratch/20260904-bwg/reality_params.txt}"
 BACKUP_ROOT="${CLAUDE_CUTOVER_BACKUP_ROOT:-/Users/zhangxinran/Scratch/20260904-bwg}"
@@ -295,8 +296,17 @@ reload_launch_agent() {
   "$LAUNCHCTL_BIN" bootstrap "gui/$USER_ID" "$PLIST"
 }
 
+reload_restored_runtime() {
+  local runtime_config="$BASE/clash-verge-guard-expanded.yaml"
+  [[ -f "$runtime_config" && -S "$SOCK" ]] || return 1
+  "$CURL_BIN" -s --unix-socket "$SOCK" -X PUT \
+    -H 'Content-Type: application/json' \
+    -d "{\"path\":\"$runtime_config\",\"force\":true}" \
+    http://localhost/configs >/dev/null
+}
+
 restore_failed_cutover() {
-  local original_rc="$1"
+  local original_rc="$1" runtime_restored=0
   trap - ERR
   set +e
   if [[ "$MUTATION_STARTED" == 1 && -n "$BACKUP_DIR" && -n "$ACTIVE_MERGE" ]]; then
@@ -308,11 +318,19 @@ restore_failed_cutover() {
     /bin/cp -p "$BACKUP_DIR/clash-verge-guard-expanded.yaml" "$BASE/clash-verge-guard-expanded.yaml"
     /bin/cp -p "$BACKUP_DIR/com.zhangxinran.claude-ip-enforcer.plist" "$PLIST"
     /bin/cp -p "$BACKUP_DIR/claude-ip-heal.wrapper" "$WRAPPER"
+    if reload_restored_runtime; then
+      runtime_restored=1
+    elif CLAUDE_MAINTENANCE_APPROVED=1 "$HEAL_BIN" "$RESIDENTIAL_IP" "$RESIDENTIAL_PORT" >/dev/null 2>&1; then
+      runtime_restored=1
+    fi
     if [[ "$ENFORCER_WAS_LOADED" == 1 ]]; then
       "$LAUNCHCTL_BIN" bootstrap "gui/$USER_ID" "$PLIST" >/dev/null 2>&1
     fi
-    CLAUDE_MAINTENANCE_APPROVED=1 "$HEAL_BIN" "$RESIDENTIAL_IP" "$RESIDENTIAL_PORT" >/dev/null 2>&1
-    "$NOTIFY_BIN" -m "Claude VPS cutover failed; residential configuration restored" >/dev/null 2>&1
+    if [[ "$runtime_restored" == 1 ]]; then
+      "$NOTIFY_BIN" -m "Claude VPS cutover failed; previous configuration restored" >/dev/null 2>&1
+    else
+      "$NOTIFY_BIN" -m "Claude VPS cutover failed; files restored but runtime recovery failed" >/dev/null 2>&1
+    fi
     printf '[claude-vps-cutover] ERROR: cutover failed; restoration attempted from %s\n' "$BACKUP_DIR" >&2
   fi
   exit "$original_rc"
