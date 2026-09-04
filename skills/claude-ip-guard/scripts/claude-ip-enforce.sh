@@ -458,6 +458,8 @@ main() {
   /bin/mkdir -p "$STATE_DIR" "$GUARD_STATE_DIR"
 
   if guard_fast_path_ok && [[ "$(current_state)" == OK && "$(current_fail_count)" == 0 ]]; then
+    # 健康轮也落盘刷新 ts，否则 cockpit 按数据时效误判守护层停摆
+    write_guard_state OK none "full chain and egress verified"
     $OPEN_ON_OK && /usr/bin/open -a Claude >/dev/null 2>&1 || true
     return 0
   fi
