@@ -3,6 +3,7 @@ set -euo pipefail
 
 TARGET_IP="${CLAUDE_STATIC_IP:-}"
 TARGET_PORT="${CLAUDE_STATIC_PORT:-}"
+RESIDENTIAL_IP="${CLAUDE_RESIDENTIAL_IP:-38.45.149.73}"
 SOCK="${CLASH_SOCK:-/tmp/verge/verge-mihomo.sock}"
 BASE="${CLASH_VERGE_BASE:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 HEAL_BIN="${CLAUDE_HEAL_BIN:-$HOME/.local/bin/claude-ip-heal}"
@@ -19,7 +20,7 @@ FAIL_THRESHOLD="${CLAUDE_ENFORCE_FAIL_THRESHOLD:-3}"
 ANTHROPIC_URL="${CLAUDE_ANTHROPIC_HEALTH_URL:-https://api.anthropic.com/}"
 ANTHROPIC_EXPECTED_STATUS="${CLAUDE_ANTHROPIC_EXPECTED_STATUS:-404}"
 MAINTENANCE_GATE_SECONDS="${CLAUDE_MAINTENANCE_GATE_SECONDS:-30}"
-FULL_CHAIN_CANDIDATES_CSV="${CLAUDE_FULL_CHAIN_CANDIDATES:-Claude-Residential-JP3,Claude-Residential-JP1}"
+FULL_CHAIN_CANDIDATES_CSV="${CLAUDE_FULL_CHAIN_CANDIDATES:-Claude-Residential-JP3,Claude-Residential-JP1,Claude-Residential-SG5,Claude-Residential-SG4}"
 
 OPEN_ON_OK=false
 SILENT=false
@@ -65,15 +66,16 @@ set_group_choice() {
 }
 
 claude_group_candidates_ok() {
-  local out
+  local out expected_choice=Claude-VPS
+  [[ "$TARGET_IP" == "$RESIDENTIAL_IP" ]] && expected_choice=Claude-Residential
   out="$(api_get_group Claude 2>/dev/null || true)"
   [[ -n "$out" ]] || return 1
   printf '%s' "$out" | "$PYTHON_BIN" -c '
 import json, sys
 d = json.load(sys.stdin)
-ok = d.get("now") == "Claude-Residential" and d.get("all") == ["Claude-Residential", "REJECT"]
+ok = d.get("now") == sys.argv[1] and d.get("all") == ["Claude-VPS", "Claude-Residential", "REJECT"]
 raise SystemExit(0 if ok else 1)
-' 2>/dev/null
+' "$expected_choice" 2>/dev/null
 }
 
 claude_residential_group_ok() {
@@ -179,7 +181,7 @@ for path in sys.argv[1:]:
     for proxy in proxies:
         if not isinstance(proxy, dict):
             continue
-        if proxy.get("name") not in {"Claude-Residential-JP3", "Claude-Residential-JP1"}:
+        if proxy.get("name") not in {"Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"}:
             continue
         values = [proxy.get(k) for k in ("username", "password", "server", "port")]
         if all(v is not None and str(v) for v in values):
@@ -201,7 +203,7 @@ residential_socks_direct_ok() {
     return 1
   }
   RESIDENTIAL_DIRECT_RESULT="$ip"
-  [[ "$ip" == "$TARGET_IP" ]]
+  [[ "$ip" == "$RESIDENTIAL_IP" ]]
 }
 
 guard_fast_path_ok() {

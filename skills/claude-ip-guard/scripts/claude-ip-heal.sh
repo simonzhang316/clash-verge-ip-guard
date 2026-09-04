@@ -3,6 +3,8 @@ set -euo pipefail
 
 TARGET_IP="${1:-${CLAUDE_STATIC_IP:-}}"
 TARGET_PORT="${2:-${CLAUDE_STATIC_PORT:-}}"
+RESIDENTIAL_IP="${CLAUDE_RESIDENTIAL_IP:-38.45.149.73}"
+RESIDENTIAL_PORT="${CLAUDE_RESIDENTIAL_PORT:-23695}"
 BASE="${CLASH_VERGE_BASE:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 SOCK="${CLASH_SOCK:-/tmp/verge/verge-mihomo.sock}"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -142,6 +144,8 @@ group_by_name = {g.get("name"): g for g in groups if isinstance(g, dict)}
 expected = {
     "Claude-Residential-JP3": "JP3-HY2",
     "Claude-Residential-JP1": "JP1-HY2",
+    "Claude-Residential-SG5": "SG5-HY2",
+    "Claude-Residential-SG4": "SG4-HY2",
 }
 for name, dialer in expected.items():
     proxy = proxy_by_name.get(name) or {}
@@ -152,8 +156,23 @@ for name, dialer in expected.items():
 
 residential = group_by_name.get("Claude-Residential") or {}
 claude = group_by_name.get("Claude") or {}
+vps = proxy_by_name.get("Claude-VPS") or {}
+reality = vps.get("reality-opts") or {}
 ok = (
-    residential.get("type") == "fallback"
+    vps.get("type") == "vless"
+    and vps.get("server") not in (None, "")
+    and isinstance(vps.get("port"), int)
+    and 1 <= vps.get("port") <= 65535
+    and vps.get("tls") is True
+    and vps.get("uuid") not in (None, "")
+    and vps.get("flow") == "xtls-rprx-vision"
+    and vps.get("servername") not in (None, "")
+    and vps.get("network") == "tcp"
+    and vps.get("client-fingerprint") == "chrome"
+    and vps.get("udp") is True
+    and reality.get("public-key") not in (None, "")
+    and reality.get("short-id") not in (None, "")
+    and residential.get("type") == "fallback"
     and residential.get("proxies") == list(expected)
     and residential.get("url") == "https://api.anthropic.com/"
     and residential.get("interval") == 15
@@ -161,7 +180,7 @@ ok = (
     and residential.get("max-failed-times") == 2
     and residential.get("expected-status") == 404
     and claude.get("type") == "select"
-    and claude.get("proxies") == ["Claude-Residential", "REJECT"]
+    and claude.get("proxies") == ["Claude-VPS", "Claude-Residential", "REJECT"]
     and "Claude-Tunnel" not in group_by_name
 )
 raise SystemExit(0 if ok else 1)
@@ -169,16 +188,26 @@ PY
 }
 
 repair_full_chain_topology() {
-  local file="$1" tmp mode
+  local file="$1" tmp mode rc f
+  local credential_files=("$file")
   [[ -f "$file" ]] || return 1
   mode="$(/usr/bin/stat -f %Lp "$file" 2>/dev/null || printf 600)"
   tmp="$(mktemp "${file}.tmp.XXXXXX")"
 
-  if ! /usr/bin/python3 - "$file" "$tmp" "$TARGET_IP" "$TARGET_PORT" <<'PY'
+  [[ -f "$BASE/clash-verge.yaml" ]] && credential_files+=("$BASE/clash-verge.yaml")
+  if [[ -d "$BASE/profiles" ]]; then
+    while IFS= read -r f; do
+      [[ "$f" == "$file" ]] || credential_files+=("$f")
+    done < <(list_yaml_files "$BASE/profiles")
+  fi
+
+  rc=0
+  /usr/bin/python3 - "$file" "$tmp" "$TARGET_IP" "$TARGET_PORT" \
+    "$RESIDENTIAL_IP" "$RESIDENTIAL_PORT" "${credential_files[@]}" <<'PY' || rc=$?
 import sys
 import yaml
 
-src, dst, target_ip, target_port = sys.argv[1:5]
+src, dst, target_ip, target_port, residential_ip, residential_port = sys.argv[1:7]
 with open(src) as f:
     data = yaml.safe_load(f) or {}
 
@@ -186,6 +215,33 @@ proxy_key = "prepend-proxies" if "prepend-proxies" in data else "proxies"
 group_key = "prepend-proxy-groups" if "prepend-proxy-groups" in data else "proxy-groups"
 proxies = [p for p in (data.get(proxy_key) or []) if isinstance(p, dict)]
 groups = [g for g in (data.get(group_key) or []) if isinstance(g, dict)]
+
+credential_proxies = []
+for path in sys.argv[7:]:
+    try:
+        with open(path) as f:
+            candidate_data = yaml.safe_load(f) or {}
+    except Exception:
+        continue
+    credential_proxies.extend(
+        p for p in (candidate_data.get("prepend-proxies") or []) + (candidate_data.get("proxies") or [])
+        if isinstance(p, dict)
+    )
+
+vps_source = next(
+    (
+        p for p in credential_proxies
+        if p.get("name") == "Claude-VPS"
+        and p.get("uuid")
+        and isinstance(p.get("reality-opts"), dict)
+        and p["reality-opts"].get("public-key")
+        and p["reality-opts"].get("short-id")
+    ),
+    None,
+)
+if vps_source is None:
+    print("Claude-VPS credentials missing", file=sys.stderr)
+    raise SystemExit(13)
 
 credential_source = next(
     (p for p in proxies if str(p.get("name", "")).startswith("Claude-Residential")),
@@ -196,8 +252,8 @@ if credential_source is None:
 
 credentials = {
     "type": "socks5",
-    "server": target_ip,
-    "port": int(target_port),
+    "server": residential_ip,
+    "port": int(residential_port),
     "username": credential_source.get("username"),
     "password": credential_source.get("password"),
     "udp": True,
@@ -205,18 +261,34 @@ credentials = {
 if not credentials["username"] or not credentials["password"]:
     raise SystemExit("Claude residential credentials incomplete")
 
-managed_proxies = [
+vps = dict(vps_source)
+if target_ip != residential_ip:
+    vps["server"] = target_ip
+    vps["port"] = int(target_port)
+
+managed_proxies = [vps,
     {"name": "Claude-Residential-JP3", **credentials, "dialer-proxy": "JP3-HY2"},
     {"name": "Claude-Residential-JP1", **credentials, "dialer-proxy": "JP1-HY2"},
+    {"name": "Claude-Residential-SG5", **credentials, "dialer-proxy": "SG5-HY2"},
+    {"name": "Claude-Residential-SG4", **credentials, "dialer-proxy": "SG4-HY2"},
 ]
-proxies = [p for p in proxies if not str(p.get("name", "")).startswith("Claude-Residential")]
+proxies = [
+    p for p in proxies
+    if p.get("name") != "Claude-VPS"
+    and not str(p.get("name", "")).startswith("Claude-Residential")
+]
 data[proxy_key] = managed_proxies + proxies
 
 managed_groups = [
     {
         "name": "Claude-Residential",
         "type": "fallback",
-        "proxies": ["Claude-Residential-JP3", "Claude-Residential-JP1"],
+        "proxies": [
+            "Claude-Residential-JP3",
+            "Claude-Residential-JP1",
+            "Claude-Residential-SG5",
+            "Claude-Residential-SG4",
+        ],
         "url": "https://api.anthropic.com/",
         "interval": 15,
         "lazy": False,
@@ -226,7 +298,7 @@ managed_groups = [
     {
         "name": "Claude",
         "type": "select",
-        "proxies": ["Claude-Residential", "REJECT"],
+        "proxies": ["Claude-VPS", "Claude-Residential", "REJECT"],
     },
 ]
 managed_names = {"Claude", "Claude-Residential", "Claude-Tunnel"}
@@ -236,8 +308,9 @@ data[group_key] = managed_groups + groups
 with open(dst, "w") as f:
     yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 PY
-  then
+  if [[ "$rc" -ne 0 ]]; then
     rm -f "$tmp"
+    [[ "$rc" -eq 13 ]] && return 13
     return 1
   fi
 
@@ -278,34 +351,80 @@ set_proxy_group_choice() {
 }
 
 extract_residential_proxy_map() {
-  local f line
+  local f
   local files=()
   [[ -f "$BASE/clash-verge.yaml" ]] && files+=("$BASE/clash-verge.yaml")
   [[ -f "$BASE/clash-verge-check.yaml" ]] && files+=("$BASE/clash-verge-check.yaml")
   if [[ -d "$BASE/profiles" ]]; then
     while IFS= read -r f; do files+=("$f"); done < <(list_yaml_files "$BASE/profiles")
   fi
+  [[ ${#files[@]} -gt 0 ]] || return 1
 
-  for f in "${files[@]}"; do
-    while IFS= read -r line; do
-      if [[ "$line" == *"Claude-Residential"* && "$line" == *"server:"* && "$line" == *"port:"* && "$line" == *"username:"* && "$line" == *"password:"* ]]; then
-        line="$(trim_left "$line")"
-        line="${line#- }"
-        line="$(printf '%s' "$line" | sed -E "s/server: [^,}]+/server: $TARGET_IP/; s/port: [0-9]+/port: $TARGET_PORT/")"
-        printf '%s' "$line"
-        return 0
-      fi
-    done < "$f"
-  done
+  /usr/bin/python3 - "$RESIDENTIAL_IP" "$RESIDENTIAL_PORT" "${files[@]}" <<'PY' 2>/dev/null
+import sys
+import yaml
 
-  return 1
+residential_ip, residential_port = sys.argv[1:3]
+for path in sys.argv[3:]:
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        continue
+    proxies = (data.get("prepend-proxies") or []) + (data.get("proxies") or [])
+    for proxy in proxies:
+        if not isinstance(proxy, dict) or not str(proxy.get("name", "")).startswith("Claude-Residential"):
+            continue
+        if not proxy.get("username") or not proxy.get("password"):
+            continue
+        result = dict(proxy)
+        result["type"] = "socks5"
+        result["server"] = residential_ip
+        result["port"] = int(residential_port)
+        result["udp"] = True
+        print(yaml.safe_dump(result, default_flow_style=True, sort_keys=False, width=1000000).strip())
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+extract_vps_proxy_map() {
+  local f
+  local files=()
+  [[ -f "$BASE/clash-verge.yaml" ]] && files+=("$BASE/clash-verge.yaml")
+  if [[ -d "$BASE/profiles" ]]; then
+    while IFS= read -r f; do files+=("$f"); done < <(list_yaml_files "$BASE/profiles")
+  fi
+  [[ ${#files[@]} -gt 0 ]] || return 1
+
+  /usr/bin/python3 - "${files[@]}" <<'PY' 2>/dev/null
+import sys
+import yaml
+
+for path in sys.argv[1:]:
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        continue
+    proxies = (data.get("prepend-proxies") or []) + (data.get("proxies") or [])
+    for proxy in proxies:
+        if not isinstance(proxy, dict) or proxy.get("name") != "Claude-VPS":
+            continue
+        reality = proxy.get("reality-opts") or {}
+        if proxy.get("uuid") and reality.get("public-key") and reality.get("short-id"):
+            print(yaml.safe_dump(proxy, default_flow_style=True, sort_keys=False, width=1000000).strip())
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 ensure_empty_merge_templates_have_claude() {
-  local proxy_map
+  local proxy_map vps_map
   proxy_map="$(extract_residential_proxy_map || true)"
-  if [[ -z "$proxy_map" ]]; then
-    warn "cannot find Claude-Residential credentials in existing configs; skip merge template bootstrap"
+  vps_map="$(extract_vps_proxy_map || true)"
+  if [[ -z "$proxy_map" || -z "$vps_map" ]]; then
+    warn "VPS credentials missing or Claude-Residential credentials unavailable; skip merge template bootstrap"
     return 0
   fi
 
@@ -319,17 +438,21 @@ ensure_empty_merge_templates_have_claude() {
     # bootstrap 产物是保底直连版:剥掉 dialer-proxy(链式引用订阅组名,灾难恢复
     # 场景下订阅未知,带上会造成组引用断链);常规链式态由 merge 源 + Verge 管理
     local proxy_map_bare
-    proxy_map_bare="$(printf '%s' "$proxy_map" | sed -E 's/,[[:space:]]*dialer-proxy:[[:space:]]*[^,}]+//')"
+    proxy_map_bare="$(printf '%s' "$proxy_map" | sed -E \
+      -e 's/name:[[:space:]]*Claude-Residential-[^,}]+/name: Claude-Residential/' \
+      -e 's/,[[:space:]]*dialer-proxy:[[:space:]]*[^,}]+//')"
     cat > "$f" <<EOF
 # Profile Enhancement Merge Template for Clash Verge
 
 prepend-proxies:
+  - $vps_map
   - $proxy_map_bare
 
 prepend-proxy-groups:
   - name: Claude
     type: select
     proxies:
+      - Claude-VPS
       - Claude-Residential
 
 prepend-rules:
@@ -351,6 +474,7 @@ prepend-rules:
   - 'IP-CIDR,160.79.104.0/21,Claude,no-resolve'
   - 'IP-CIDR6,2607:6bc0::/48,Claude,no-resolve'
   - 'IP-CIDR,$TARGET_IP/32,DIRECT,no-resolve'
+  - 'IP-CIDR,$RESIDENTIAL_IP/32,DIRECT,no-resolve'
 EOF
     log "bootstrapped-merge-template: $f"
   done < <(list_yaml_files "$BASE/profiles")
@@ -894,8 +1018,8 @@ try:
 except Exception:
     raise SystemExit(1)
 ok = (
-    claude.get("all") == ["Claude-Residential", "REJECT"]
-    and residential.get("all") == ["Claude-Residential-JP3", "Claude-Residential-JP1"]
+    claude.get("all") == ["Claude-VPS", "Claude-Residential", "REJECT"]
+    and residential.get("all") == ["Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"]
     and residential.get("now") in residential.get("all", [])
 )
 raise SystemExit(0 if ok else 1)
@@ -953,11 +1077,11 @@ write_expanded_runtime_config() {
   active_merge="$(resolve_active_merge_source || true)"
   [[ -n "$active_merge" && -f "$active_merge" ]] || return 1
 
-  /usr/bin/python3 - "$src" "$dst" "$TARGET_IP" "$active_merge" <<'PY'
+  /usr/bin/python3 - "$src" "$dst" "$TARGET_IP" "$RESIDENTIAL_IP" "$active_merge" <<'PY'
 import sys
 import yaml
 
-src, dst, target_ip, active_merge = sys.argv[1:5]
+src, dst, target_ip, residential_ip, active_merge = sys.argv[1:6]
 with open(src) as f:
     data = yaml.safe_load(f)
 with open(active_merge) as f:
@@ -978,7 +1102,8 @@ groups = data.get("proxy-groups") or []
 rules = data.get("rules") or []
 
 all_proxies = [p for p in prepend_proxies + proxies if isinstance(p, dict)]
-qualified_names = ["Claude-Residential-JP3", "Claude-Residential-JP1"]
+residential_names = ["Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"]
+qualified_names = ["Claude-VPS"] + residential_names
 qualified_proxies = []
 for name in qualified_names:
     match = next((p for p in all_proxies if p.get("name") == name), None)
@@ -987,7 +1112,8 @@ for name in qualified_names:
     qualified_proxies.append(match)
 data["proxies"] = qualified_proxies + [
     p for p in proxies
-    if not str(p.get("name", "")).startswith("Claude-Residential")
+    if p.get("name") != "Claude-VPS"
+    and not str(p.get("name", "")).startswith("Claude-Residential")
 ]
 
 merged_groups = [g for g in groups + prepend_groups if isinstance(g, dict)]
@@ -995,6 +1121,7 @@ merged_rules = [r for r in prepend_rules if r not in rules] + rules
 
 claude_rules = [
     f"IP-CIDR,{target_ip}/32,DIRECT,no-resolve",
+    f"IP-CIDR,{residential_ip}/32,DIRECT,no-resolve",
     "DOMAIN,ifconfig.me,Claude",
     "DOMAIN,api.ipify.org,Claude",
     "DOMAIN,ipv4.icanhazip.com,Claude",
@@ -1018,6 +1145,7 @@ def is_claude_rule(rule):
     text = str(rule)
     return any(term in text for term in [
         target_ip,
+        residential_ip,
         "Claude-Fast",
         "anthropic.com",
         "claude.ai",
@@ -1049,14 +1177,14 @@ clean_groups = [
     {
         "name": "Claude-Residential",
         "type": "fallback",
-        "proxies": qualified_names,
+        "proxies": residential_names,
         "url": "https://api.anthropic.com/",
         "interval": 15,
         "lazy": False,
         "max-failed-times": 2,
         "expected-status": 404,
     },
-    {"name": "Claude", "type": "select", "proxies": ["Claude-Residential", "REJECT"]},
+    {"name": "Claude", "type": "select", "proxies": ["Claude-VPS", "Claude-Residential", "REJECT"]},
 ] + other_groups
 
 data["proxy-groups"] = clean_groups
@@ -1127,16 +1255,20 @@ reload_core() {
   curl --unix-socket "$SOCK" -s -X PATCH -H 'Content-Type: application/json' \
     -d '{"tun":{"enable":true}}' http://localhost/configs >/dev/null || return 23
 
-  # Never route the residential SOCKS endpoint back into TUN/proxy chain.
+  # Never route the VPS or residential endpoint back into TUN/proxy chain.
   # Also exclude Tailscale's CGNAT (100.64.0.0/10) and IPv6 ULA (fd7a:115c:a1e0::/48)
   # so the Tailscale virtual network bypasses mihomo's TUN entirely. This lets
   # the user's Tailscale-based monitoring apps keep working without conflicting
   # with the gvisor stack, and reduces mihomo's connection-tracker pressure.
   curl --unix-socket "$SOCK" -s -X PATCH -H 'Content-Type: application/json' \
-    -d "{\"tun\":{\"enable\":true,\"route-exclude-address\":[\"$TARGET_IP/32\",\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\"]}}" http://localhost/configs >/dev/null || return 23
+    -d "{\"tun\":{\"enable\":true,\"route-exclude-address\":[\"$TARGET_IP/32\",\"$RESIDENTIAL_IP/32\",\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\"]}}" http://localhost/configs >/dev/null || return 23
 
-  # Ensure Claude group points to Claude-Residential
-  set_proxy_group_choice "Claude" "Claude-Residential" || return 24
+  # Keep rollback mode on the residential group; normal mode pins Claude-VPS.
+  if [[ "$TARGET_IP" == "$RESIDENTIAL_IP" ]]; then
+    set_proxy_group_choice "Claude" "Claude-Residential" || return 24
+  else
+    set_proxy_group_choice "Claude" "Claude-VPS" || return 24
+  fi
   runtime_core_settings_ok || return 25
   if runtime_claude_needs_reload; then
     err "runtime topology verification failed after repair"

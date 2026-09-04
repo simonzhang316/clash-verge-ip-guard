@@ -2,7 +2,7 @@
 """Cockpit server (S1 guard bridge + S2 mihomo read-only bridge).
 
 Per ADR-0002 (single repairer rule):
-- The Cockpit never probes the residential egress itself; it reads the
+- The Cockpit never probes the Claude egress itself; it reads the
   guard's state.json written by claude-ip-enforce.
 - The mihomo bridge is GET-only against an exact-match whitelist. No
   /delay endpoints (active probing), no mutation endpoints. mihomo's
@@ -70,7 +70,7 @@ _node_count_cache: dict[str, tuple[float, int | None]] = {}
 # --- S3 operations layer ---------------------------------------------------
 # Ops are the ONLY mutating surface and they are runtime-only (ADR-0002):
 # selector switching (Claude locked), manual delay tests (never for groups
-# containing Claude-Residential), guard recheck via launchctl kickstart.
+# containing a Claude exit), guard recheck via launchctl kickstart.
 COCKPIT_TOKEN_FILE = Path(
     os.environ.get(
         "COCKPIT_TOKEN_FILE",
@@ -142,10 +142,13 @@ def op_delay_test(payload: dict) -> tuple[int, dict]:
         return 404, {"error": "group_not_found"}
     if info.get("type") not in GROUP_TYPES:
         return 400, {"error": "not_a_group"}
-    if "Claude-Residential" in (info.get("all") or []):
+    if any(
+        exit_group in (info.get("all") or [])
+        for exit_group in ("Claude-VPS", "Claude-Residential")
+    ):
         return 403, {
-            "error": "claude_residential_protected",
-            "hint": "该组包含家宽节点，禁止主动测速（ADR-0002）",
+            "error": "claude_exit_protected",
+            "hint": "该组包含 Claude 出口节点，禁止主动测速（ADR-0002）",
         }
     with _delay_lock:
         now = time.monotonic()
