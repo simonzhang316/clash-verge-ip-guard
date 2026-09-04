@@ -113,7 +113,7 @@
 
 <div class="grid">
   <div class="card" id="guard-card">
-    <h2>家宽出口（Claude 静态 IP）</h2>
+    <h2>Claude 出口（静态 IP）</h2>
     <span class="badge gray" id="guard-badge">加载中</span>
     <button class="btn-sm" id="recheck-btn" title="触发 enforcer 立即跑一轮（守护层仍是唯一修复者）">重检出口</button>
     <div class="kv">
@@ -170,7 +170,7 @@
 </div>
 
 <footer>
-  数据来源：守护层 state.json + mihomo 只读桥（unix socket，白名单）。Cockpit 为只读观察者：不探测家宽出口、不主动测速、不写任何配置（ADR-0002）。
+  数据来源：守护层 state.json + mihomo 只读桥（unix socket，白名单）。Cockpit 为只读观察者：不探测 Claude 出口、不主动测速、不写任何配置（ADR-0002）。
 </footer>
 
 <script>
@@ -289,8 +289,9 @@ function renderGroups(proxies) {
       `<span class="gtype">${esc(g.type)}</span>` +
       `<span class="gnow">${esc(g.now || "—")}</span>` +
       `<span class="ms"><span class="dot ${dotCls(delay)}"></span>${delay ? delay + " ms" : "—"}</span>`;
-    // 测速按钮：Claude 锁定组与含家宽节点的组不提供（服务端同样拒绝）
-    const testable = name !== "Claude" && !(g.all || []).includes("Claude-Residential");
+    // 测速按钮：Claude 锁定组与含 Claude 出口节点的组不提供（服务端同样拒绝）
+    const testable = name !== "Claude" &&
+      !["Claude-VPS", "Claude-Residential"].some(n => (g.all || []).includes(n));
     if (testable) {
       const btn = document.createElement("button");
       btn.className = "btn-sm";
@@ -505,7 +506,7 @@ async function refreshConnsInner() {
     `${conns.length} 条连接` + (filter ? `（筛选: ${filter}）` : "") + ` · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
 }
 
-// ---- 全局出口（S6）：低频探测（服务端 60s 缓存），与家宽出口对照 ----
+// ---- 全局出口（S6）：低频探测（服务端 60s 缓存），与 Claude 出口对照 ----
 let guardExpectedIp = null;
 
 async function refreshEgress(force) {
@@ -527,8 +528,8 @@ async function refreshEgress(force) {
     badge.className = "badge bad"; badge.textContent = "全局出口探测失败";
     note.textContent = "两个探测源都失败：主代理链路可能异常（若仅 HTTPS 源失败，多为机场节点 TLS 问题）。";
   } else if (guardExpectedIp && d.ip === guardExpectedIp) {
-    badge.className = "badge bad"; badge.textContent = d.ip + "（＝家宽 IP！）";
-    note.textContent = "全局出口不应等于家宽 IP——全局流量正在消耗家宽出口，检查规则/模式。";
+    badge.className = "badge bad"; badge.textContent = d.ip + "（＝Claude 出口 IP！）";
+    note.textContent = "全局出口不应等于 Claude 出口 IP——全局流量正在占用 Claude 专用出口，检查规则/模式。";
   } else {
     badge.className = "badge ok"; badge.textContent = d.ip;
     note.textContent = (d.cached ? "缓存结果 · " : "") + "探测于 " + (d.probed_at || "").replace("T", " ").replace(/\+.*$/, "") + "（经 MATCH 兜底规则，非 Claude 路径）";
