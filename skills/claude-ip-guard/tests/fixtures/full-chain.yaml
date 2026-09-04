@@ -1,4 +1,18 @@
 prepend-proxies:
+  - name: Claude-VPS
+    type: vless
+    server: 198.51.100.20
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    network: tcp
+    udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: www.example.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: fixture-public-key
+      short-id: fixture-short-id
   - name: Claude-Residential-JP3
     type: socks5
     server: 192.0.2.10
@@ -15,6 +29,22 @@ prepend-proxies:
     password: fixture-password
     udp: true
     dialer-proxy: JP1-HY2
+  - name: Claude-Residential-SG5
+    type: socks5
+    server: 192.0.2.10
+    port: 443
+    username: fixture-user
+    password: fixture-password
+    udp: true
+    dialer-proxy: SG5-HY2
+  - name: Claude-Residential-SG4
+    type: socks5
+    server: 192.0.2.10
+    port: 443
+    username: fixture-user
+    password: fixture-password
+    udp: true
+    dialer-proxy: SG4-HY2
 
 prepend-proxy-groups:
   - name: Claude-Residential
@@ -22,6 +52,8 @@ prepend-proxy-groups:
     proxies:
       - Claude-Residential-JP3
       - Claude-Residential-JP1
+      - Claude-Residential-SG5
+      - Claude-Residential-SG4
     url: https://api.anthropic.com/
     interval: 15
     lazy: false
@@ -30,6 +62,7 @@ prepend-proxy-groups:
   - name: Claude
     type: select
     proxies:
+      - Claude-VPS
       - Claude-Residential
       - REJECT
 
@@ -38,4 +71,3 @@ prepend-rules:
   - DOMAIN-SUFFIX,anthropic.com,Claude
   - DOMAIN-SUFFIX,claude.ai,Claude
   - PROCESS-NAME,claude,Claude
-

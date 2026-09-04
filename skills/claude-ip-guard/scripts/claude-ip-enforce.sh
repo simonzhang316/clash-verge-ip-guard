@@ -3,6 +3,7 @@ set -euo pipefail
 
 TARGET_IP="${CLAUDE_STATIC_IP:-}"
 TARGET_PORT="${CLAUDE_STATIC_PORT:-}"
+RESIDENTIAL_IP="${CLAUDE_RESIDENTIAL_IP:-38.45.149.73}"
 SOCK="${CLASH_SOCK:-/tmp/verge/verge-mihomo.sock}"
 BASE="${CLASH_VERGE_BASE:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 HEAL_BIN="${CLAUDE_HEAL_BIN:-$HOME/.local/bin/claude-ip-heal}"
@@ -65,15 +66,16 @@ set_group_choice() {
 }
 
 claude_group_candidates_ok() {
-  local out
+  local out expected_choice=Claude-VPS
+  [[ "$TARGET_IP" == "$RESIDENTIAL_IP" ]] && expected_choice=Claude-Residential
   out="$(api_get_group Claude 2>/dev/null || true)"
   [[ -n "$out" ]] || return 1
   printf '%s' "$out" | "$PYTHON_BIN" -c '
 import json, sys
 d = json.load(sys.stdin)
-ok = d.get("now") == "Claude-Residential" and d.get("all") == ["Claude-Residential", "REJECT"]
+ok = d.get("now") == sys.argv[1] and d.get("all") == ["Claude-VPS", "Claude-Residential", "REJECT"]
 raise SystemExit(0 if ok else 1)
-' 2>/dev/null
+' "$expected_choice" 2>/dev/null
 }
 
 claude_residential_group_ok() {
@@ -201,7 +203,7 @@ residential_socks_direct_ok() {
     return 1
   }
   RESIDENTIAL_DIRECT_RESULT="$ip"
-  [[ "$ip" == "$TARGET_IP" ]]
+  [[ "$ip" == "$RESIDENTIAL_IP" ]]
 }
 
 guard_fast_path_ok() {
