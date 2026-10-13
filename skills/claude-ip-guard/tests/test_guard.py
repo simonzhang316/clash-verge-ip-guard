@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shlex
@@ -20,6 +21,7 @@ HEAL = GUARD_DIR / "scripts" / "claude-ip-heal.sh"
 CUTOVER = GUARD_DIR / "scripts" / "cutover.sh"
 ROLLBACK = GUARD_DIR / "scripts" / "rollback.sh"
 MERGE_EXAMPLE = ROOT / "merge-profile-example.yaml"
+PROFILE_SCRIPT = GUARD_DIR / "scripts" / "verge-profile-script.js"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -489,6 +491,80 @@ check_ip_with_warmup
 """
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ProfileScriptTests(unittest.TestCase):
+    """Verge 订阅挂的 script：在 Verge 自己生成配置时就把 merge 源留下的 prepend-* 展开。"""
+
+    def run_script(self, config: dict) -> dict:
+        self.assertTrue(PROFILE_SCRIPT.is_file(), "profile script source is missing")
+        with tempfile.TemporaryDirectory() as td:
+            runner = Path(td) / "run.js"
+            runner.write_text(
+                PROFILE_SCRIPT.read_text()
+                + "\nJSON.stringify(main("
+                + json.dumps(config, ensure_ascii=False)
+                + ', "fixture"));\n'
+            )
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-l", "JavaScript", str(runner)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def verge_output_before_script(self) -> dict:
+        merge = yaml.safe_load((FIXTURES / "full-chain.yaml").read_text())
+        merge["prepend-proxy-groups"].append(
+            {"name": "Codex-Stable", "type": "fallback", "proxies": ["Claude-VPS", "SG5-HY2", "OpenAI"]}
+        )
+        return {
+            **merge,
+            "tun": {"enable": True, "route-exclude-address": []},
+            "proxies": [{"name": "SG5-HY2", "type": "direct"}, {"name": "JP3-HY2", "type": "direct"}],
+            "proxy-groups": [
+                {"name": "主代理", "type": "select", "proxies": ["自动选择", "SG5-HY2"]},
+                {"name": "自动选择", "type": "url-test", "proxies": ["SG5-HY2"]},
+                {"name": "OpenAI", "type": "select", "proxies": ["主代理"]},
+            ],
+            "rules": ["DOMAIN-SUFFIX,example.com,主代理", "MATCH,主代理"],
+        }
+
+    def test_script_expands_merge_prepend_keys_without_heal(self) -> None:
+        source = self.verge_output_before_script()
+        out = self.run_script(source)
+        self.assertFalse([key for key in out if key.startswith("prepend-")])
+        groups = {group["name"]: group for group in out["proxy-groups"]}
+        self.assertEqual(groups["Claude"]["proxies"], ["Claude-VPS", "Claude-Residential", "REJECT"])
+        self.assertEqual(
+            groups["Claude-Residential"]["proxies"],
+            ["Claude-Residential-JP3", "Claude-Residential-JP1", "Claude-Residential-SG5", "Claude-Residential-SG4"],
+        )
+        self.assertEqual(groups["主代理"]["proxies"], ["Claude-VPS", "自动选择", "SG5-HY2"])
+        self.assertEqual(groups["Codex-Stable"]["proxies"], ["Claude-VPS", "SG5-HY2", "OpenAI"])
+        names = [group["name"] for group in out["proxy-groups"]]
+        self.assertEqual(len(names), len(set(names)))
+        proxy_names = [proxy["name"] for proxy in out["proxies"]]
+        self.assertEqual(len(proxy_names), len(set(proxy_names)))
+        self.assertIn("Claude-VPS", proxy_names)
+        rules = out["rules"]
+        self.assertEqual(len(rules), len(set(rules)))
+        for rule in source["prepend-rules"]:
+            self.assertLess(rules.index(rule), rules.index("MATCH,主代理"))
+        self.assertIn("IP-CIDR,198.51.100.20/32,DIRECT,no-resolve", rules)
+        self.assertIn("IP-CIDR,192.0.2.10/32,DIRECT,no-resolve", rules)
+        self.assertEqual(
+            sorted(out["tun"]["route-exclude-address"]),
+            ["100.64.0.0/10", "192.0.2.10/32", "198.51.100.20/32", "fd7a:115c:a1e0::/48"],
+        )
+
+    def test_script_leaves_config_alone_without_merge_keys(self) -> None:
+        bare = self.run_script({"proxies": [], "proxy-groups": [{"name": "主代理", "type": "select", "proxies": ["DIRECT"]}], "rules": ["MATCH,主代理"]})
+        groups = {group["name"]: group for group in bare["proxy-groups"]}
+        self.assertEqual(groups["主代理"]["proxies"], ["DIRECT"])
+        self.assertNotIn("Claude", groups)
 
 
 if __name__ == "__main__":
