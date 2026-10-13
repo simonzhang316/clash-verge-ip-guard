@@ -307,6 +307,14 @@ print(count)
 ' 2>/dev/null
 }
 
+# Claude 组整组不在运行时里（订阅刷新 / 冷启动后 Verge 载入未展开配置）。
+# 此时 Claude 请求已经落到别的策略组，连接闸门没有可保护的东西。
+claude_group_missing() {
+  local out
+  out="$(api_get_group Claude 2>/dev/null || true)"
+  [[ -n "$out" && "$out" != *'"Claude-VPS"'* ]]
+}
+
 maintenance_gate_clear() {
   local elapsed=0 count
   while :; do
@@ -402,7 +410,7 @@ run_enforcer_cycle() {
   fi
 
   if [[ "$FAST_PATH_FAILURE" == runtime-invariant ]]; then
-    if maintenance_gate_clear; then
+    if claude_group_missing || maintenance_gate_clear; then
       append_guard_event heal_invoked runtime-invariant
       write_guard_state HEAL runtime-invariant "maintenance gate clear; heal invoked"
       if run_heal && guard_fast_path_ok; then

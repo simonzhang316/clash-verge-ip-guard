@@ -122,6 +122,38 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+    def test_missing_claude_group_heals_without_waiting_for_connection_gate(self) -> None:
+        body = """
+healed=0
+claude_active_connection_count() { printf 6; }
+guard_fast_path_ok() { FAST_PATH_FAILURE=runtime-invariant; ((healed)); }
+run_heal() { healed=1; }
+append_guard_event() { :; }
+write_guard_state() { :; }
+recover_state_if_needed() { :; }
+handle_availability_failure() { return 1; }
+"""
+        # 订阅刷新后 Claude 组整组消失：Claude 请求已经在走别的出口，等连接清空只会拖长裸奔
+        missing = self.source_enforcer(
+            body
+            + """
+api_get_group() { printf '{"message":"resource not found"}'; }
+run_enforcer_cycle
+((healed == 1))
+"""
+        )
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        present = self.source_enforcer(
+            body
+            + """
+api_get_group() { printf '{"all":["Claude-VPS","Claude-Residential","REJECT"],"now":"Claude-VPS"}'; }
+run_enforcer_cycle || true
+((healed == 0))
+"""
+        )
+        self.assertEqual(present.returncode, 0, present.stderr)
+
+
 class TopologyTests(unittest.TestCase):
     def test_cutover_scripts_load_vps_endpoint_from_local_params(self) -> None:
         with tempfile.TemporaryDirectory() as td:
