@@ -1116,6 +1116,9 @@ data["proxies"] = qualified_proxies + [
     and not str(p.get("name", "")).startswith("Claude-Residential")
 ]
 
+# 同名组以 merge 源为准：订阅刷新后 Verge 重新生成的组会丢掉 merge 源里的成员（如 Codex-Stable 首位的 Claude-VPS）
+prepend_group_by_name = {g.get("name"): g for g in prepend_groups if isinstance(g, dict)}
+groups = [prepend_group_by_name.get(g.get("name"), g) if isinstance(g, dict) else g for g in groups]
 merged_groups = [g for g in groups + prepend_groups if isinstance(g, dict)]
 merged_rules = [r for r in prepend_rules if r not in rules] + rules
 
@@ -1191,6 +1194,8 @@ data["proxy-groups"] = clean_groups
 data["rules"] = claude_rules + [r for r in merged_rules if not is_claude_rule(r)]
 
 for group in data["proxy-groups"]:
+    if isinstance(group, dict) and group.get("name") == "主代理":
+        group["proxies"] = ["Claude-VPS"] + [p for p in group.get("proxies") or [] if p != "Claude-VPS"]
     if isinstance(group, dict) and group.get("name") == "Codex-Stable":
         group["interval"] = 300
         group["lazy"] = True
@@ -1243,6 +1248,8 @@ reload_core() {
       return 22
     }
     log "core reloaded (HEAL_CHANGED=$HEAL_CHANGED, expanded-runtime)"
+    # 主代理（URL 编码）：整份重载后选回 VPS；平时不动，手动切换不会被每轮覆盖
+    set_proxy_group_choice "%E4%B8%BB%E4%BB%A3%E7%90%86" "Claude-VPS" || warn "cannot select Claude-VPS for main proxy group"
   else
     log "core reload skipped (no on-disk change this run)"
   fi
