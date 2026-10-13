@@ -344,6 +344,93 @@ validate_full_chain_topology "{candidate}"
             self.assertEqual(vps.get("server"), "198.51.100.20")
             self.assertEqual(vps.get("port"), 443)
 
+    def test_expanded_config_keeps_vps_first_after_subscription_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "profiles").mkdir()
+            merge = yaml.safe_load((FIXTURES / "full-chain.yaml").read_text())
+            merge["prepend-proxy-groups"].append(
+                {"name": "Codex-Stable", "type": "fallback", "proxies": ["Claude-VPS", "SG5-HY2", "OpenAI"]}
+            )
+            (base / "profiles" / "merge.yaml").write_text(yaml.safe_dump(merge, allow_unicode=True, sort_keys=False))
+            (base / "profiles.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "current": "sub",
+                        "items": [
+                            {"uid": "m", "type": "merge", "file": "merge.yaml"},
+                            {"uid": "sub", "type": "remote", "file": "sub.yaml", "option": {"merge": "m"}},
+                        ],
+                    }
+                )
+            )
+            # Verge 刷新订阅后重新生成的配置：两个组都回到订阅自带的成员
+            (base / "clash-verge.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "proxies": [{"name": "SG5-HY2", "type": "direct"}],
+                        "proxy-groups": [
+                            {"name": "主代理", "type": "select", "proxies": ["自动选择", "SG5-HY2"]},
+                            {"name": "自动选择", "type": "url-test", "proxies": ["SG5-HY2"]},
+                            {"name": "OpenAI", "type": "select", "proxies": ["主代理"]},
+                            {"name": "Codex-Stable", "type": "fallback", "proxies": ["SG5-HY2", "OpenAI"]},
+                        ],
+                        "rules": ["MATCH,主代理"],
+                    },
+                    allow_unicode=True,
+                    sort_keys=False,
+                )
+            )
+            result = run_bash(
+                f"""
+source "{HEAL}"
+BASE={shlex.quote(str(base))}
+TARGET_IP=198.51.100.20
+RESIDENTIAL_IP=192.0.2.10
+write_expanded_runtime_config >/dev/null
+"""
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = yaml.safe_load((base / "clash-verge-guard-expanded.yaml").read_text())
+            groups = {group["name"]: group for group in data["proxy-groups"]}
+            self.assertEqual(groups["主代理"]["proxies"], ["Claude-VPS", "自动选择", "SG5-HY2"])
+            self.assertEqual(groups["Codex-Stable"]["proxies"], ["Claude-VPS", "SG5-HY2", "OpenAI"])
+            self.assertEqual([g["name"] for g in data["proxy-groups"]].count("Codex-Stable"), 1)
+
+    def test_full_reload_selects_vps_for_main_proxy_group(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            sock = Path(td) / "s.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(sock))
+            try:
+                body = f"""
+source "{HEAL}"
+SOCK={shlex.quote(str(sock))}
+TARGET_IP=198.51.100.20
+RESIDENTIAL_IP=192.0.2.10
+CLAUDE_MAINTENANCE_APPROVED=1
+choices=""
+curl() {{ :; }}
+write_expanded_runtime_config() {{ printf '%s' /etc/hosts; }}
+set_proxy_group_choice() {{ choices="$choices $1=$2"; }}
+runtime_core_settings_ok() {{ :; }}
+runtime_claude_needs_reload() {{ return 1; }}
+"""
+                reloaded = run_bash(body + """
+HEAL_CHANGED=1
+reload_core
+[[ "$choices" == *"%E4%B8%BB%E4%BB%A3%E7%90%86=Claude-VPS"* ]]
+""")
+                self.assertEqual(reloaded.returncode, 0, reloaded.stderr)
+                skipped = run_bash(body + """
+HEAL_CHANGED=0
+reload_core
+[[ "$choices" != *"%E4%B8%BB%E4%BB%A3%E7%90%86"* ]]
+""")
+                self.assertEqual(skipped.returncode, 0, skipped.stderr)
+            finally:
+                listener.close()
+
     def test_heal_rejects_legacy_tunnel_topology(self) -> None:
         result = run_bash(
             f"""
