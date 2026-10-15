@@ -22,6 +22,7 @@ CUTOVER = GUARD_DIR / "scripts" / "cutover.sh"
 ROLLBACK = GUARD_DIR / "scripts" / "rollback.sh"
 MERGE_EXAMPLE = ROOT / "merge-profile-example.yaml"
 PROFILE_SCRIPT = GUARD_DIR / "scripts" / "verge-profile-script.js"
+ALIENWARE_WATCH = GUARD_DIR / "scripts" / "alienware-guard-watch.sh"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -565,6 +566,122 @@ class ProfileScriptTests(unittest.TestCase):
         groups = {group["name"]: group for group in bare["proxy-groups"]}
         self.assertEqual(groups["主代理"]["proxies"], ["DIRECT"])
         self.assertNotIn("Claude", groups)
+
+
+class AlienwareWatchTests(unittest.TestCase):
+    """Mac 侧巡检外星人 Windows 守护：读它的 state.json，异常时经通报 bot 告警。"""
+
+    NOW = 1_792_000_000
+
+    def setUp(self) -> None:
+        self.td = tempfile.TemporaryDirectory()
+        self.dir = Path(self.td.name)
+        self.state_file = self.dir / "remote-state.json"
+        self.sent = self.dir / "sent.log"
+        fake_ssh = self.dir / "fake-ssh"
+        fake_ssh.write_text(
+            '#!/bin/bash\n[ -f "$FAKE_REMOTE_STATE" ] || exit 255\ncat "$FAKE_REMOTE_STATE"\n'
+        )
+        fake_notify = self.dir / "fake-notify"
+        fake_notify.write_text('#!/bin/bash\nprintf "%s\\n---\\n" "$*" >> "$FAKE_SENT"\n')
+        fake_ssh.chmod(0o755)
+        fake_notify.chmod(0o755)
+        self.env = {
+            **os.environ,
+            "LC_ALL": "C",
+            "WATCH_SSH": str(fake_ssh),
+            "NOTIFY_CMD": str(fake_notify),
+            "WATCH_STATE_DIR": str(self.dir / "watch-state"),
+            "FAKE_REMOTE_STATE": str(self.state_file),
+            "FAKE_SENT": str(self.sent),
+        }
+
+    def tearDown(self) -> None:
+        self.td.cleanup()
+
+    def remote(self, status: str, at_min: int = 0, age_min: int = 0, detail: str = "L1 controller error: (404)") -> None:
+        import datetime
+
+        tz = datetime.timezone(datetime.timedelta(hours=8))
+        ts = datetime.datetime.fromtimestamp(self.NOW + (at_min - age_min) * 60, tz).strftime("%Y-%m-%dT%H:%M:%S.1234567+08:00")
+        self.state_file.write_text(
+            json.dumps({"ts": ts, "status": status, "fail_count": 1, "detail": detail}, indent=4).replace("\n", "\r\n")
+        )
+
+    def unreachable(self) -> None:
+        self.state_file.unlink(missing_ok=True)
+
+    def run_watch(self, minutes_later: int = 0) -> None:
+        self.assertTrue(ALIENWARE_WATCH.is_file(), "alienware watch script is missing")
+        result = subprocess.run(
+            ["/bin/bash", str(ALIENWARE_WATCH)],
+            env={**self.env, "WATCH_NOW": str(self.NOW + minutes_later * 60)},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def messages(self) -> list[str]:
+        if not self.sent.exists():
+            return []
+        return [m.strip() for m in self.sent.read_text().split("---") if m.strip()]
+
+    def test_healthy_guard_stays_silent(self) -> None:
+        self.remote("OK")
+        for i in range(3):
+            self.run_watch(i * 10)
+        self.assertEqual(self.messages(), [])
+
+    def test_failing_guard_alerts_once_after_two_runs(self) -> None:
+        self.remote("FAIL")
+        self.run_watch(0)
+        self.assertEqual(self.messages(), [], "one bad run may be a blip")
+        self.remote("FAIL", at_min=10)
+        self.run_watch(10)
+        self.remote("FAIL", at_min=20)
+        self.run_watch(20)
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("L1 controller error", msgs[0])
+        self.assertIn("-m", msgs[0])
+
+    def test_recovery_is_reported(self) -> None:
+        self.remote("FAIL")
+        self.run_watch(0)
+        self.run_watch(10)
+        self.remote("OK", detail="mode=rule; Claude=Claude-VPS; egress=23.106.156.254")
+        self.run_watch(20)
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 2, msgs)
+        self.assertIn("恢复", msgs[1])
+
+    def test_unreachable_alienware_alerts(self) -> None:
+        self.unreachable()
+        self.run_watch(0)
+        self.run_watch(10)
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("连不上外星人", msgs[0])
+
+    def test_stale_state_means_guard_stopped(self) -> None:
+        self.remote("OK", age_min=45)
+        self.run_watch(0)
+        self.run_watch(10)
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("没更新", msgs[0])
+
+    def test_long_outage_reminds_every_twelve_hours(self) -> None:
+        for at in (0, 10, 6 * 60):
+            self.remote("FAIL", at_min=at)
+            self.run_watch(at)
+        self.assertEqual(len(self.messages()), 1)
+        self.remote("FAIL", at_min=13 * 60)
+        self.run_watch(13 * 60)
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 2, msgs)
+        self.assertIn("仍未恢复", msgs[1])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 安装：cp 到 ~/Library/LaunchAgents/ 后 launchctl bootstrap gui/$(id -u) <plist> -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zhangxinran.alienware-guard-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/zhangxinran/Projects/clash-verge/skills/claude-ip-guard/scripts/alienware-guard-watch.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/Users/zhangxinran/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/zhangxinran/.local/state/alienware-guard-watch/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/zhangxinran/.local/state/alienware-guard-watch/launchd.log</string>
+</dict>
+</plist>
