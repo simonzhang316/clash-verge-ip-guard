@@ -3,13 +3,19 @@
 #
 # Windows 守护跑在 SYSTEM 账号下，告警只写进它自己的 events.jsonl，没人看得见
 # （2026-09-30 起断网 16 天无人知）。这里由 Mac launchd 每 10 分钟 SSH 读它的 state.json，
-# 异常连续两轮就经通报 bot 告警：守护报错 / 状态超过 30 分钟没更新（计划任务停了）/ SSH 连不上外星人。
+# 异常连续两轮就经通报 bot 告警：守护报错 / 状态超过 30 分钟没更新（计划任务停了）。
 # 恢复时报一次；一直没恢复则每 12 小时提醒一次。只读，不往外星人写任何东西，不碰任何内核。
+#
+# 连不上外星人一律当关机，不报：master 不用就关机（1016 亲述），关机是常态。
+# 关机前报过的问题会保留，下次开机恢复了照样报恢复。
+# 局域网 IP 常漂，所以第二条线不用写死的 IP，按网卡 MAC 在 ARP 表里找当前 IP。
 #
 # 巡检自身状态：$WATCH_STATE_DIR/watch.json（最后一轮的结论、连到哪台、告警到了哪一步）
 set -uo pipefail
 
-WATCH_HOSTS="${WATCH_HOSTS:-alienware alienware2}"
+WATCH_HOSTS="${WATCH_HOSTS:-alienware}"
+WATCH_LAN_MAC="${WATCH_LAN_MAC-14:d8:64:a7:5a:4c}"
+LAN_HOST_KEY_ALIAS=192.168.2.55   # known_hosts 里外星人主机密钥登记在这个旧局域网 IP 名下
 WATCH_SSH="${WATCH_SSH:-/usr/bin/ssh}"
 NOTIFY_CMD="${NOTIFY_CMD:-$HOME/claudecode_xinran/scripts/notify-master.sh}"
 WATCH_STATE_DIR="${WATCH_STATE_DIR:-$HOME/.local/state/alienware-guard-watch}"
@@ -24,6 +30,13 @@ for host in $WATCH_HOSTS; do
     break
   fi
 done
+if [ -z "$reached" ] && [ -n "$WATCH_LAN_MAC" ]; then
+  lan_ip="$(/usr/sbin/arp -an 2>/dev/null | awk -v mac="$WATCH_LAN_MAC" 'tolower($4) == mac { gsub(/[()]/, "", $2); print $2; exit }')"
+  if [ -n "$lan_ip" ] &&
+    "$WATCH_SSH" -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlias="$LAN_HOST_KEY_ALIAS" "DELL@$lan_ip" "type $REMOTE_STATE" >"$fetched" 2>/dev/null && [ -s "$fetched" ]; then
+    reached="lan:$lan_ip"
+  fi
+fi
 [ -n "$reached" ] || : >"$fetched"
 
 message="$(/usr/bin/python3 - "$fetched" "$WATCH_STATE_DIR/watch.json" "${WATCH_NOW:-$(date +%s)}" "$reached" <<'PY'
@@ -55,7 +68,13 @@ def duration(seconds):
 
 raw, detail = "ok", ""
 if not host:
-    raw = "unreachable"
+    # 连不上 = 关机：不报，也不动关机前的告警状态
+    watch.update({"last_run": now, "host": "", "raw": "offline"})
+    tmp = watch_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(watch, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, watch_path)
+    sys.exit(0)
 else:
     try:
         with open(fetched, encoding="utf-8-sig") as f:
@@ -77,7 +96,6 @@ alerted = watch.get("alerted", "")
 alerted_at = watch.get("alerted_at", 0)
 
 ALERTS = {
-    "unreachable": "连不上外星人：Tailscale 和局域网两条线 SSH 都不通，已持续约 {dur}。可能关机、断网，或者局域网 IP 又漂了。去劳模说。",
     "fail": "外星人 Claude 守护连续报错，已持续约 {dur}，Claude 和外网可能都断了。守护原话：{detail}。去劳模说。",
     "stale": "外星人守护的状态{detail}，计划任务 claude-ip-guard 可能停了。去劳模说。",
 }
