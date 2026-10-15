@@ -594,6 +594,7 @@ class AlienwareWatchTests(unittest.TestCase):
             "WATCH_STATE_DIR": str(self.dir / "watch-state"),
             "FAKE_REMOTE_STATE": str(self.state_file),
             "FAKE_SENT": str(self.sent),
+            "WATCH_LAN_MAC": "",
         }
 
     def tearDown(self) -> None:
@@ -656,13 +657,26 @@ class AlienwareWatchTests(unittest.TestCase):
         self.assertEqual(len(msgs), 2, msgs)
         self.assertIn("恢复", msgs[1])
 
-    def test_unreachable_alienware_alerts(self) -> None:
+    def test_powered_off_alienware_is_silent(self) -> None:
+        # master 不用外星人时就关机，连不上是常态，不能每次都报
         self.unreachable()
+        for at in (0, 10, 20, 13 * 60):
+            self.run_watch(at)
+        self.assertEqual(self.messages(), [])
+
+    def test_problem_before_shutdown_reports_recovery_after_boot(self) -> None:
+        self.remote("FAIL")
         self.run_watch(0)
         self.run_watch(10)
+        self.unreachable()
+        for at in (20, 30, 13 * 60):
+            self.run_watch(at)
+        self.assertEqual(len(self.messages()), 1, "shutdown must not re-alert or remind")
+        self.remote("OK", at_min=14 * 60, detail="mode=rule; Claude=Claude-VPS; egress=23.106.156.254")
+        self.run_watch(14 * 60)
         msgs = self.messages()
-        self.assertEqual(len(msgs), 1, msgs)
-        self.assertIn("连不上外星人", msgs[0])
+        self.assertEqual(len(msgs), 2, msgs)
+        self.assertIn("恢复", msgs[1])
 
     def test_stale_state_means_guard_stopped(self) -> None:
         self.remote("OK", age_min=45)
